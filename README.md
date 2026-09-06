@@ -1,5 +1,10 @@
 # ToolRush-MCP
 
+[![ci](https://github.com/dhava-gautama/toolrush-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dhava-gautama/toolrush-mcp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dhava-gautama/toolrush-mcp)](https://github.com/dhava-gautama/toolrush-mcp/releases/latest)
+[![Go Report Card](https://goreportcard.com/badge/github.com/dhava-gautama/toolrush-mcp)](https://goreportcard.com/report/github.com/dhava-gautama/toolrush-mcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Kill the tool-call tax — in any agent harness.** A fast local tool server
 for [Kimi Code CLI](https://www.kimi.com/code), [Codex CLI](https://github.com/openai/codex),
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code), and anything
@@ -132,6 +137,10 @@ python3 bench/bench_lang.py                               # transport floor
 | `main.go` | the Go server (the shipped implementation) |
 | `python/` | Python reference implementation (`toolrush_mcp.py`), the smoke suite, lane bench |
 | `bench/` | cross-language benchmarks + pure-C transport-floor reference |
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Origin and license
 

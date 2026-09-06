@@ -1,0 +1,57 @@
+version: 2
+
+project_name: toolrush-mcp
+
+builds:
+  - id: toolrush-mcp
+    binary: toolrush-mcp
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - artifacts: archive
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))?[!:]? .*$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))?[!:]? .*$'
+      order: 1
+    - title: Documentation
+      regexp: '^.*?docs(\([[:word:]]+\))?[!:]? .*$'
+      order: 2
+    - title: Other
+      regexp: '^.*?chore(\([[:word:]]+\))?[!:]? .*$'
+      order: 3
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - "^test:"
+      - "^test\\("
+      - "^docs:"
+      - "^docs\\("
+      - "^chore:"
+      - "^chore\\("
+      - "^Merge "

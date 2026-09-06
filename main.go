@@ -2,7 +2,8 @@
 // github.com/OnlyTerp/toolrush, Hermes Agent plugin) to a static binary.
 //
 // Same wire contract, same tools, same envelopes as the Python reference:
-//   fast_read  batch_read  fast_search  warm_exec  batch_exec  doctor
+//
+//	fast_read  batch_read  fast_search  warm_exec  batch_exec  doctor
 //
 // What Go buys (measured in bench_go.py, evidence in README):
 //   - per-request goroutines: a 120s warm_exec no longer head-of-line blocks
@@ -10,6 +11,7 @@
 //   - ~1ms startup vs ~68ms interpreter boot (paid per session)
 //   - GIL-free CPU: decode/render parallelize when they need to
 //   - static binary, no Python runtime dependency
+//
 // Kill-switches (fail-closed): TOOLRUSH_FASTLANE/SEARCH/PERSIST/PARALLEL=0
 package main
 
@@ -27,6 +29,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,7 +38,18 @@ import (
 	"unicode/utf8"
 )
 
-const version = "2.2.0-go"
+// version is injected at release time via -X main.version=...; a dev build
+// falls back to the module version from runtime/debug.ReadBuildInfo (set by
+// `go install ...@vX.Y.Z`), else stays "dev".
+var version = "dev"
+
+func init() {
+	if version == "dev" {
+		if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" {
+			version = bi.Main.Version
+		}
+	}
+}
 
 var (
 	useFastlane = os.Getenv("TOOLRUSH_FASTLANE") != "0"
@@ -45,15 +59,17 @@ var (
 )
 
 const (
-	maxLine           = 2000
-	maxReadBytes      = 100_000
-	maxOut            = 8 << 20
-	readDefaultLimit  = 1000
-	searchTimeout     = 60 * time.Second
+	maxLine            = 2000
+	maxReadBytes       = 100_000
+	maxOut             = 8 << 20
+	readDefaultLimit   = 1000
+	searchTimeout      = 60 * time.Second
 	execDefaultTimeout = 120
-	batchMax          = 16
-	linesCacheMax     = 64
-	largeFile         = 64 << 20
+	batchMax           = 16
+	linesCacheMax      = 64
+	largeFile          = 64 << 20
+	cacheFileMax       = 4 << 20
+	walkMaxFile        = 16 << 20
 )
 
 var imageSuffixes = map[string]bool{
@@ -147,15 +163,19 @@ func decodeStore(rp string, st os.FileInfo, raw []byte) ([]string, string) {
 		return nil, "binary file (not UTF-8 decodable)"
 	}
 	lines := splitLines(raw)
-	linesMu.Lock()
-	if len(linesCache) >= linesCacheMax {
-		for k := range linesCache { // evict an arbitrary (oldest-ish) entry
-			delete(linesCache, k)
-			break
+	// Byte budget: serving the read is fine, but caching a huge file
+	// multiplies RSS (lines + raw string copies). Skip the store.
+	if st.Size() <= cacheFileMax {
+		linesMu.Lock()
+		if len(linesCache) >= linesCacheMax {
+			for k := range linesCache { // evict an arbitrary (oldest-ish) entry
+				delete(linesCache, k)
+				break
+			}
 		}
+		linesCache[rp] = linesEntry{st.ModTime().UnixNano(), st.Size(), lines}
+		linesMu.Unlock()
 	}
-	linesCache[rp] = linesEntry{st.ModTime().UnixNano(), st.Size(), lines}
-	linesMu.Unlock()
 	return lines, ""
 }
 
@@ -176,7 +196,9 @@ func getLines(rp string, st os.FileInfo) ([]string, string) {
 
 func render(lines []string, size int64, offset, limit int) string {
 	total := len(lines)
-	if size == 0 {
+	// Kernel pseudo-files (/proc et al.) stat as 0 bytes but hold content —
+	// only claim emptiness when the read itself produced nothing.
+	if size == 0 && (total == 0 || (total == 1 && lines[0] == "")) {
 		return jmap(map[string]any{
 			"success": true, "content": "", "total_lines": 0,
 			"file_size": 0, "hint": "File is empty (0 bytes)."})
@@ -259,6 +281,9 @@ func streamRead(rp string, st os.FileInfo, offset, limit int) string {
 				}
 				sb.WriteString(strconv.Itoa(lineNo) + "\t" + line)
 				shown++
+				if shown == limit {
+					break // got the window — don't scan to EOF
+				}
 			}
 		}
 		if err != nil {
@@ -282,6 +307,9 @@ func fastRead(path string, offset, limit int) string {
 	}
 	if limit > readDefaultLimit {
 		limit = readDefaultLimit
+	}
+	if offset == 0 { // page 1; negatives stay tail mode
+		offset = 1
 	}
 	rp := resolvePath(path)
 	st, err := os.Stat(rp)
@@ -480,6 +508,11 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// hitLineRx parses rg's --line-number --no-heading "path:line:content" rows.
+// Non-greedy path + backtracking resolves colons inside the path
+// (co:lon/f.txt:1:hit), which SplitN(3) parsed wrong.
+var hitLineRx = regexp.MustCompile(`^(.+?):(\d+):(.*)$`)
+
 func collectHits(out, engine string, limit, offset int) string {
 	type hit struct {
 		Path    string `json:"path"`
@@ -496,16 +529,16 @@ func collectHits(out, engine string, limit, offset int) string {
 		if total <= offset || len(hits) >= limit {
 			continue
 		}
-		parts := strings.SplitN(raw, ":", 3)
-		if len(parts) < 3 {
+		m := hitLineRx.FindStringSubmatch(raw)
+		if m == nil {
 			continue
 		}
-		no, _ := strconv.Atoi(parts[1])
-		content := parts[2]
+		no, _ := strconv.Atoi(m[2])
+		content := m[3]
 		if len(content) > maxLine {
 			content = content[:maxLine] + "... [truncated]"
 		}
-		hits = append(hits, hit{parts[0], no, content})
+		hits = append(hits, hit{m[1], no, content})
 	}
 	return jmap(map[string]any{
 		"success": true, "engine": engine, "hits": hits,
@@ -530,7 +563,14 @@ func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offse
 	}
 	hits := []hit{}
 	total := 0
+	deadline := time.Now().Add(searchTimeout)
+	timedOut := false
 	_ = filepath.WalkDir(root, func(fp string, d os.DirEntry, err error) error {
+		if time.Now().After(deadline) {
+			timedOut = true
+			return fmt.Errorf("walk deadline exceeded after %ds",
+				int(searchTimeout.Seconds()))
+		}
 		if err != nil {
 			return nil
 		}
@@ -548,6 +588,9 @@ func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offse
 		}
 		if skipSuffixes[strings.ToLower(filepath.Ext(name))] {
 			return nil
+		}
+		if fi, err := d.Info(); err != nil || fi.Size() > walkMaxFile {
+			return nil // unreadable or too large to walk
 		}
 		raw, err := os.ReadFile(fp)
 		if err != nil {
@@ -576,7 +619,7 @@ func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offse
 	return jmap(map[string]any{
 		"success": true, "engine": "walk", "hits": hits,
 		"total_hits": total, "shown": len(hits),
-		"truncated": total > offset+len(hits)})
+		"truncated": timedOut || total > offset+len(hits)})
 }
 
 func fastSearch(pattern, path, fileGlob string, caseSensitive bool, limit, offset int) string {
@@ -593,6 +636,8 @@ func fastSearch(pattern, path, fileGlob string, caseSensitive bool, limit, offse
 
 // --------------------------------------------------------------- warm_exec
 
+const outTruncNotice = "\n[output truncated at 8MB]"
+
 type warmShell struct {
 	mu    sync.Mutex
 	cmd   *exec.Cmd
@@ -607,6 +652,10 @@ func newLineChan() chan *string { return make(chan *string, 65536) }
 func (s *warmShell) spawnLocked(cwd string) {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
+	}
+	if s.stdin != nil { // drop the old shell's stdin before replacing it
+		_ = s.stdin.Close()
+		s.stdin = nil
 	}
 	s.cwd = cwd
 	cmd := exec.Command("bash", "--noprofile", "--norc")
@@ -635,6 +684,9 @@ func (s *warmShell) spawnLocked(cwd string) {
 	s.alive = true
 	ch := s.lines
 	go func() {
+		// Sole reaper: after EOF the shell is gone — close the pipe and
+		// Wait() to reap the zombie, then report the death. No one else
+		// may Wait (double-Wait is an error).
 		r := bufio.NewReader(pr)
 		for {
 			line, err := r.ReadString('\n')
@@ -643,6 +695,8 @@ func (s *warmShell) spawnLocked(cwd string) {
 				ch <- &l
 			}
 			if err != nil {
+				_ = pr.Close()
+				_ = cmd.Wait()
 				ch <- nil
 				return
 			}
@@ -656,9 +710,8 @@ func (s *warmShell) killLocked() {
 		_ = s.cmd.Process.Kill()
 	}
 	s.alive = false
-	if s.cmd != nil {
-		go s.cmd.Wait() // reap
-	}
+	// No Wait here: the reader goroutine of this very shell reaps it once
+	// the pipe hits EOF. killLocked only signals.
 }
 
 func (s *warmShell) reset() {
@@ -670,7 +723,8 @@ func (s *warmShell) reset() {
 }
 
 // run executes one command. rc: 124 timeout, -1 shell died. Never retries.
-func (s *warmShell) run(command, cwd string, timeout time.Duration) (string, int) {
+// The third return reports that output hit the 8MB cap (notice appended).
+func (s *warmShell) run(command, cwd string, timeout time.Duration) (string, int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.alive {
@@ -678,7 +732,7 @@ func (s *warmShell) run(command, cwd string, timeout time.Duration) (string, int
 		bump("shell_respawns")
 	}
 	if !s.alive {
-		return "", -1
+		return "", -1, false
 	}
 	// drain strays from backgrounded jobs of earlier calls
 	for {
@@ -704,10 +758,11 @@ drained:
 		"printf '\\n%s:%d:%s\\n' '" + endP + "' $_rc \"$PWD\"\n"
 	if _, err := io.WriteString(s.stdin, frame); err != nil {
 		s.alive = false
-		return "", -1
+		return "", -1, false
 	}
 	var out strings.Builder
 	nbytes := 0
+	truncated := false
 	rc := -1
 	deadline := time.Now().Add(timeout)
 	endMarker := endP + ":"
@@ -717,7 +772,7 @@ drained:
 			s.killLocked()
 			out.WriteString(fmt.Sprintf("\n[timed out after %ds — "+
 				"command tree killed, shell will respawn]", int(timeout.Seconds())))
-			return out.String(), 124
+			return out.String(), 124, truncated
 		}
 		timer := time.NewTimer(remain)
 		select {
@@ -725,7 +780,7 @@ drained:
 			timer.Stop()
 			if lp == nil { // shell died mid-command; do NOT retry
 				s.alive = false
-				return out.String(), -1
+				return out.String(), -1, truncated
 			}
 			line := *lp
 			if line == begin {
@@ -741,9 +796,16 @@ drained:
 						s.cwd = parts[2]
 					}
 				}
-				return out.String(), rc
+				return out.String(), rc, truncated
 			}
-			if nbytes+len(line)+1 > maxOut {
+			// Cap accounting reserves room for the notice so the final
+			// stdout stays within maxOut even after appending it.
+			if truncated || nbytes+len(line)+1 > maxOut-len(outTruncNotice) {
+				if !truncated {
+					out.WriteString(outTruncNotice)
+					nbytes += len(outTruncNotice)
+					truncated = true
+				}
 				continue // bounded parser memory: drop, keep consuming
 			}
 			nbytes += len(line) + 1
@@ -753,7 +815,7 @@ drained:
 			s.killLocked()
 			out.WriteString(fmt.Sprintf("\n[timed out after %ds — "+
 				"command tree killed, shell will respawn]", int(timeout.Seconds())))
-			return out.String(), 124
+			return out.String(), 124, truncated
 		}
 	}
 }
@@ -778,7 +840,8 @@ func warmExec(command, cwd string, timeoutSec int, reset bool) string {
 	}
 	bump("warm_exec")
 	if !usePersist {
-		// negative control: spawn-per-call
+		// negative control: spawn-per-call. Combined stdout+stderr capped
+		// at maxOut with the same notice as the warm path.
 		ctx, cancel := context.WithTimeout(context.Background(),
 			time.Duration(timeoutSec)*time.Second)
 		defer cancel()
@@ -787,12 +850,13 @@ func warmExec(command, cwd string, timeoutSec int, reset bool) string {
 			cmd.Dir = cwd
 		}
 		var so, se bytes.Buffer
-		cmd.Stdout = &so
-		cmd.Stderr = &se
+		perStream := (maxOut - len(outTruncNotice)) / 2
+		cmd.Stdout = &limitedWriter{w: &so, max: perStream}
+		cmd.Stderr = &limitedWriter{w: &se, max: perStream}
 		err := cmd.Run()
 		if ctx.Err() == context.DeadlineExceeded {
 			return jmap(map[string]any{"success": false, "mode": "spawn",
-				"stdout": "", "exit_code": 124,
+				"stdout": "", "exit_code": 124, "truncated": false,
 				"error": fmt.Sprintf("timed out after %ds", timeoutSec)})
 		}
 		rc := 0
@@ -801,15 +865,21 @@ func warmExec(command, cwd string, timeoutSec int, reset bool) string {
 		} else if err != nil {
 			rc = -1
 		}
+		truncated := so.Len() >= perStream || se.Len() >= perStream
+		stdout := so.String() + se.String()
+		if truncated {
+			stdout += outTruncNotice
+		}
 		return jmap(map[string]any{"success": rc == 0, "mode": "spawn",
-			"stdout": so.String() + se.String(), "exit_code": rc})
+			"stdout": stdout, "exit_code": rc, "truncated": truncated})
 	}
 	if reset {
 		shell.reset()
 	}
-	out, rc := shell.run(command, cwd, time.Duration(timeoutSec)*time.Second)
+	out, rc, truncated := shell.run(command, cwd, time.Duration(timeoutSec)*time.Second)
 	d := map[string]any{"success": rc == 0, "mode": "persist",
-		"stdout": strings.TrimRight(out, "\n"), "exit_code": rc}
+		"stdout": strings.TrimRight(out, "\n"), "exit_code": rc,
+		"truncated": truncated}
 	if rc == 124 {
 		d["error"] = fmt.Sprintf("timed out after %ds", timeoutSec)
 	} else if rc == -1 {
@@ -888,7 +958,7 @@ func doctor() string {
 	shell.mu.Unlock()
 	return jmap(map[string]any{
 		"success": true, "version": version,
-		"go": strings.TrimPrefix(runtime.Version(), "go"),
+		"go":       strings.TrimPrefix(runtime.Version(), "go"),
 		"platform": runtime.GOOS,
 		"kill_switches": map[string]bool{
 			"TOOLRUSH_FASTLANE": useFastlane, "TOOLRUSH_SEARCH": useSearch,
@@ -1065,6 +1135,20 @@ func handle(req rpcRequest) {
 	}
 }
 
+// envIsError derives MCP isError from the parsed tool envelope rather than
+// sniffing its first bytes: true when success==false or error is non-empty.
+// Envelopes without a success field and no error (none today) stay false.
+func envIsError(r string) bool {
+	var m struct {
+		Success *bool  `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(r), &m); err != nil {
+		return true
+	}
+	return (m.Success != nil && !*m.Success) || m.Error != ""
+}
+
 // dispatchTool returns (envelopeText, isError, unknownTool).
 func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 	switch name {
@@ -1084,7 +1168,8 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 		if a.Limit != nil {
 			lim = *a.Limit
 		}
-		return fastRead(a.Path, off, lim), false, false
+		r := fastRead(a.Path, off, lim)
+		return r, envIsError(r), false
 	case "batch_read":
 		var a struct {
 			Ops []readOp `json:"ops"`
@@ -1093,7 +1178,7 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			return jerr("ops must be a non-empty list of {path, offset?, limit?}"), true, false
 		}
 		r := batchRead(a.Ops)
-		return r, strings.Contains(r[:min(80, len(r))], `"success":false`), false
+		return r, envIsError(r), false
 	case "fast_search":
 		var a struct {
 			Pattern       string `json:"pattern"`
@@ -1118,7 +1203,7 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			off = *a.Offset
 		}
 		r := fastSearch(a.Pattern, a.Path, a.FileGlob, cs, lim, off)
-		return r, strings.Contains(r[:min(80, len(r))], `"success":false`), false
+		return r, envIsError(r), false
 	case "warm_exec":
 		var a struct {
 			Command string `json:"command"`
@@ -1133,7 +1218,8 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 		if a.Timeout != nil {
 			to = *a.Timeout
 		}
-		return warmExec(a.Command, a.Cwd, to, a.Reset), false, false
+		r := warmExec(a.Command, a.Cwd, to, a.Reset)
+		return r, envIsError(r), false
 	case "batch_exec":
 		var a struct {
 			Commands []string `json:"commands"`
@@ -1148,18 +1234,11 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			to = *a.Timeout
 		}
 		r := batchExec(a.Commands, a.Cwd, to)
-		return r, strings.Contains(r[:min(80, len(r))], `"success":false`), false
+		return r, envIsError(r), false
 	case "doctor":
 		return doctor(), false, false
 	}
 	return "", false, true
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func main() {

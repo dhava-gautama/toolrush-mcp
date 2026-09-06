@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "toolrush-mcp",
+  "owner": {
+    "name": "dhava-gautama",
+    "url": "https://github.com/dhava-gautama"
+  },
+  "plugins": [
+    {
+      "name": "toolrush-mcp",
+      "description": "Fast local MCP tool server: line-gutter reads with caching, batched reads, ripgrep-backed search, one persistent warm bash, batched exec, and a doctor lane.",
+      "version": "1.0.1",
+      "author": {
+        "name": "dhava-gautama"
+      },
+      "homepage": "https://github.com/dhava-gautama/toolrush-mcp",
+      "repository": "https://github.com/dhava-gautama/toolrush-mcp",
+      "license": "MIT",
+      "keywords": ["mcp", "tools", "agent", "search", "shell"],
+      "source": "./",
+      "mcpServers": {
+        "toolrush": {
+          "type": "stdio",
+          "command": "toolrush-mcp",
+          "args": []
+        }
+      }
+    }
+  ]
+}

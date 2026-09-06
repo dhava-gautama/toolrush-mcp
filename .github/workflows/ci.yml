@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ["1.27"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          # stdlib-only module, no go.sum — nothing worth caching
+          cache: false
+
+      - name: Install ripgrep (smoke suite asserts the rg engine)
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install ripgrep
+          else
+            sudo apt-get update && sudo apt-get install -y ripgrep
+          fi
+
+      - name: gofmt gate
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+      - name: Build binary
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o toolrush-go .
+
+      - name: Smoke suite
+        run: TOOLRUSH_SERVER=./toolrush-go python3 python/smoke.py

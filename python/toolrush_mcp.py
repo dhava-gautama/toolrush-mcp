@@ -47,7 +47,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "2.1.0-mcp"
+VERSION = "1.0.1"
 
 USE_FASTLANE = os.environ.get("TOOLRUSH_FASTLANE", "1") == "1"
 USE_SEARCH = os.environ.get("TOOLRUSH_SEARCH", "1") == "1"
@@ -57,11 +57,15 @@ USE_PARALLEL = os.environ.get("TOOLRUSH_PARALLEL", "1") == "1"
 MAX_LINE = 2000            # per-line clamp, same as upstream _max_line_length
 MAX_READ_BYTES = 100_000   # response byte cap per fast_read page
 MAX_OUT = 8 * 1024 * 1024  # bounded parser memory for warm_exec / fast_search
+OUT_TRUNC_NOTICE = "\n[output truncated at 8MB]"
 READ_DEFAULT_LIMIT = 1000
 SEARCH_TIMEOUT = 60
 EXEC_DEFAULT_TIMEOUT = 120
 BATCH_MAX = 16
 BATCH_WORKERS = 4
+
+CACHE_FILE_MAX = 4 * 1024 * 1024    # skip the lines-cache STORE beyond this
+WALK_MAX_FILE = 16 * 1024 * 1024    # walk fallback refuses to read past this
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico")
 SKIP_SUFFIXES = IMAGE_SUFFIXES + (".pyc", ".pyo")
@@ -112,10 +116,13 @@ def _decode_store(rp, st, raw):
     except UnicodeDecodeError:
         return None, "binary file (not UTF-8 decodable)"
     lines = text.splitlines()
-    with _LINES_LOCK:
-        if len(_LINES_CACHE) >= LINES_CACHE_MAX:
-            _LINES_CACHE.pop(next(iter(_LINES_CACHE)))  # oldest-first eviction
-        _LINES_CACHE[str(rp)] = (st.st_mtime_ns, st.st_size, lines)
+    # Byte budget: serving the read is fine, but caching a huge file
+    # multiplies RSS (lines + raw copies). Skip the store.
+    if st.st_size <= CACHE_FILE_MAX:
+        with _LINES_LOCK:
+            if len(_LINES_CACHE) >= LINES_CACHE_MAX:
+                _LINES_CACHE.pop(next(iter(_LINES_CACHE)))  # oldest-first eviction
+            _LINES_CACHE[str(rp)] = (st.st_mtime_ns, st.st_size, lines)
     return lines, None
 
 
@@ -132,7 +139,9 @@ def _get_lines(rp, st):
 def _render(lines, size, offset, limit):
     """Gutter render shared by fast_read and batch_read's cache probe."""
     total = len(lines)
-    if size == 0:
+    # /proc-style files stat 0 but have content — only claim emptiness
+    # when the read itself produced nothing.
+    if size == 0 and (total == 0 or (total == 1 and lines[0] == "")):
         return _j({"success": True, "content": "", "total_lines": 0,
                    "file_size": 0, "hint": "File is empty (0 bytes)."})
     if offset < 0:  # tail mode: offset=-N -> last N lines
@@ -220,6 +229,8 @@ def fast_read(path, offset=1, limit=READ_DEFAULT_LIMIT):
         limit = 1
     if limit > READ_DEFAULT_LIMIT:
         limit = READ_DEFAULT_LIMIT
+    if offset == 0:  # page 1; negatives stay tail mode
+        offset = 1
 
     rp = _resolve(path)
     if not rp.is_file():
@@ -296,6 +307,11 @@ def batch_read(ops):
 _RG = None
 _RGVER = None
 
+# Parses rg's --line-number --no-heading "path:line:content" rows. The
+# non-greedy path + backtracking resolves colons inside the path
+# (co:lon/f.txt:1:hit), which a plain partition(":") misparsed.
+_HIT_LINE_RX = re.compile(r"^(.+?):(\d+):(.*)$")
+
 
 def _rg():
     global _RG
@@ -325,16 +341,19 @@ def _search_rg(pattern, path, file_glob, case_sensitive, limit, offset):
     hits = []
     total = 0
     for raw in r.stdout.decode("utf-8", "replace").splitlines():
+        if not raw:
+            continue
         total += 1
-        if total <= offset:
+        if total <= offset or len(hits) >= limit:
             continue
-        if len(hits) >= limit:
+        m = _HIT_LINE_RX.match(raw)
+        if m is None:
             continue
-        fpath, _, rest = raw.partition(":")
-        no, _, line = rest.partition(":")
+        no = int(m.group(2))
+        line = m.group(3)
         if len(line) > MAX_LINE:
             line = line[:MAX_LINE] + "... [truncated]"
-        hits.append({"path": fpath, "line": int(no or 0), "content": line})
+        hits.append({"path": m.group(1), "line": no, "content": line})
     return _j({"success": True, "engine": "rg", "hits": hits,
                "total_hits": total, "shown": len(hits),
                "truncated": total > offset + len(hits)})
@@ -352,17 +371,24 @@ def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset):
     root = _resolve(path)
     hits = []
     total = 0
+    timed_out = False
+    deadline = time.monotonic() + SEARCH_TIMEOUT
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         if ".git" in dirnames:
             dirnames.remove(".git")
         for fn in sorted(filenames):
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
             if file_glob and not fnmatch.fnmatch(fn, file_glob):
                 continue
             fp = Path(dirpath) / fn
             if fp.suffix.lower() in SKIP_SUFFIXES:
                 continue
             try:
+                if fp.stat().st_size > WALK_MAX_FILE:
+                    continue  # too large to walk
                 raw = fp.read_bytes()
             except OSError:
                 continue
@@ -379,9 +405,11 @@ def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset):
                         if len(line) > MAX_LINE:
                             line = line[:MAX_LINE] + "... [truncated]"
                         hits.append({"path": str(fp), "line": no, "content": line})
+        if timed_out:
+            break
     return _j({"success": True, "engine": "walk", "hits": hits,
                "total_hits": total, "shown": len(hits),
-               "truncated": total > offset + len(hits)})
+               "truncated": timed_out or total > offset + len(hits)})
 
 
 def fast_search(pattern, path, file_glob=None, case_sensitive=True,
@@ -431,6 +459,12 @@ class WarmShell:
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     q.put(line.decode("utf-8", "replace"))
+            # Sole reaper: after EOF the shell is gone — Wait() to reap the
+            # zombie (and free its pid/fd), then report the death.
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
             q.put(None)  # EOF sentinel: shell died
 
         threading.Thread(target=reader, args=(self._proc, self._q),
@@ -450,7 +484,7 @@ class WarmShell:
             self._spawn(os.getcwd())
 
     def run(self, command, cwd=None, timeout=EXEC_DEFAULT_TIMEOUT):
-        """Returns (stdout_str, rc). rc: 124 timeout, -1 shell died.
+        """Returns (stdout_str, rc, truncated). rc: 124 timeout, -1 shell died.
         Never retries a submitted command."""
         with self._lock:
             if not self._alive():
@@ -478,7 +512,7 @@ class WarmShell:
                 proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._proc = None
-                return "", -1
+                return "", -1, False
             out, nbytes, rc = [], 0, -1
             truncated = False
             deadline = time.monotonic() + timeout
@@ -488,17 +522,17 @@ class WarmShell:
                     self._kill_tree()
                     out.append(f"\n[timed out after {timeout}s — "
                                f"command tree killed, shell will respawn]")
-                    return "".join(out), 124
+                    return "".join(out), 124, truncated
                 try:
                     line = q.get(timeout=remain)
                 except queue.Empty:
                     self._kill_tree()
                     out.append(f"\n[timed out after {timeout}s — "
                                f"command tree killed, shell will respawn]")
-                    return "".join(out), 124
+                    return "".join(out), 124, truncated
                 if line is None:  # shell died mid-command; do NOT retry
                     self._proc = None
-                    return "".join(out), -1
+                    return "".join(out), -1, truncated
                 if line == begin:
                     continue
                 if line.startswith(endm):
@@ -510,21 +544,30 @@ class WarmShell:
                             rc = -1
                         if parts[2]:
                             self._cwd = parts[2]
-                    return "".join(out), rc
-                if nbytes + len(line) + 1 > MAX_OUT:
-                    truncated = True
-                    continue
-                if truncated:
-                    continue
+                    return "".join(out), rc, truncated
+                # Cap accounting reserves room for the notice so the final
+                # stdout stays within MAX_OUT even after appending it.
+                if truncated or nbytes + len(line) + 1 > MAX_OUT - len(OUT_TRUNC_NOTICE):
+                    if not truncated:
+                        out.append(OUT_TRUNC_NOTICE)
+                        nbytes += len(OUT_TRUNC_NOTICE)
+                        truncated = True
+                    continue  # bounded parser memory: drop, keep consuming
                 nbytes += len(line) + 1
                 out.append(line + "\n")
             # unreachable
 
     def _kill_tree(self):
-        try:
-            os.killpg(self._proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, AttributeError):
-            pass
+        proc = self._proc
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=5)  # reap now; reader also waits (idempotent)
+            except Exception:
+                pass
         self._proc = None
 
 
@@ -543,22 +586,59 @@ def warm_exec(command, cwd=None, timeout=EXEC_DEFAULT_TIMEOUT, reset=False):
     _STATS["warm_exec"] += 1
     if not USE_PERSIST:
         # Negative control: spawn-per-call, same signature (v1 exec_spawn).
+        # Combined stdout+stderr capped at MAX_OUT with the same notice as
+        # the warm path: half the budget each so the concatenation (plus
+        # notice) stays within MAX_OUT.
+        per_stream = (MAX_OUT - len(OUT_TRUNC_NOTICE)) // 2
         try:
-            r = subprocess.run(["bash", "--noprofile", "--norc", "-c", command],
-                               capture_output=True, text=True, timeout=timeout,
-                               cwd=cwd or os.getcwd())
-            return _j({"success": r.returncode == 0, "mode": "spawn",
-                       "stdout": r.stdout + r.stderr, "exit_code": r.returncode})
+            proc = subprocess.Popen(
+                ["bash", "--noprofile", "--norc", "-c", command],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=cwd or os.getcwd())
+        except OSError as e:
+            return _err(f"{type(e).__name__}: {e}")
+
+        def _drain(f, cap, sink):
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                if len(sink) < cap:
+                    sink += chunk[:cap - len(sink)]
+
+        so, se = bytearray(), bytearray()
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, per_stream, so))
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, per_stream, se))
+        t_out.start()
+        t_err.start()
+        try:
+            rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            t_out.join()
+            t_err.join()
             return _j({"success": False, "mode": "spawn", "stdout": "",
-                       "exit_code": 124, "error": f"timed out after {timeout}s"})
+                       "exit_code": 124, "truncated": False,
+                       "error": f"timed out after {timeout}s"})
+        t_out.join()
+        t_err.join()
+        truncated = len(so) >= per_stream or len(se) >= per_stream
+        stdout = so.decode("utf-8", "replace") + se.decode("utf-8", "replace")
+        if truncated:
+            stdout += OUT_TRUNC_NOTICE
+        return _j({"success": rc == 0, "mode": "spawn", "stdout": stdout,
+                   "exit_code": rc, "truncated": truncated})
     if _SHELL is None:
         _SHELL = WarmShell()
     if reset:
         _SHELL.reset()
-    out, rc = _SHELL.run(command, cwd=cwd, timeout=timeout)
+    out, rc, truncated = _SHELL.run(command, cwd=cwd, timeout=timeout)
     d = {"success": rc == 0, "mode": "persist",
-         "stdout": out.rstrip("\n"), "exit_code": rc}
+         "stdout": out.rstrip("\n"), "exit_code": rc, "truncated": truncated}
     if rc == 124:
         d["error"] = f"timed out after {timeout}s"
     elif rc == -1:
@@ -712,6 +792,19 @@ def _reply(mid, result=None, error=None):
     sys.stdout.flush()
 
 
+def _env_is_error(text):
+    """Derive MCP isError from the parsed tool envelope rather than a fixed
+    flag: true when success==false or a non-empty "error" key exists.
+    Envelopes without a success field and no error (none today) stay false."""
+    try:
+        env = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return True
+    if not isinstance(env, dict):
+        return True
+    return env.get("success") is False or bool(env.get("error"))
+
+
 def serve():
     for raw in sys.stdin:
         raw = raw.strip()
@@ -749,7 +842,7 @@ def serve():
                 try:
                     text = fn(args)
                     _reply(mid, {"content": [{"type": "text", "text": text}],
-                                 "isError": False})
+                                 "isError": _env_is_error(text)})
                 except Exception as e:
                     _reply(mid, {"content": [{"type": "text",
                                               "text": _err(f"{type(e).__name__}: {e}")}],
