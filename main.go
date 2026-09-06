@@ -3,7 +3,8 @@
 //
 // Same wire contract, same tools, same envelopes as the Python reference:
 //
-//	fast_read  batch_read  fast_search  warm_exec  batch_exec  doctor
+//	fast_read  batch_read  fast_search  batch_search  fast_tree
+//	warm_exec  batch_exec  doctor
 //
 // What Go buys (measured in bench_go.py, evidence in README):
 //   - per-request goroutines: a 120s warm_exec no longer head-of-line blocks
@@ -85,7 +86,8 @@ var skipSuffixes = map[string]bool{
 
 var statsMu sync.Mutex
 var stats = map[string]int{
-	"fast_read": 0, "batch_read": 0, "fast_search": 0, "warm_exec": 0,
+	"fast_read": 0, "batch_read": 0, "fast_search": 0, "batch_search": 0,
+	"fast_tree": 0, "warm_exec": 0,
 	"batch_exec": 0, "cache_hits": 0, "shell_respawns": 0,
 }
 
@@ -457,8 +459,20 @@ func clampLimitOffset(limit, offset int) (int, int) {
 	return limit, offset
 }
 
-func searchRg(pattern, path, fileGlob string, caseSensitive bool, limit, offset int) string {
-	args := []string{"--line-number", "--no-heading", "--color", "never",
+// clampCtx bounds the fast_search context param: 0..5, default 0. At 0 the
+// envelopes stay byte-identical to pre-context builds (no "context" field).
+func clampCtx(c int) int {
+	if c < 0 {
+		return 0
+	}
+	if c > 5 {
+		return 5
+	}
+	return c
+}
+
+func searchRg(pattern, path, fileGlob string, caseSensitive bool, limit, offset, ctx int) string {
+	args := []string{"--line-number", "--no-heading", "--with-filename", "--color", "never",
 		"--encoding", "utf-8"}
 	if !caseSensitive {
 		args = append(args, "-i")
@@ -466,15 +480,20 @@ func searchRg(pattern, path, fileGlob string, caseSensitive bool, limit, offset 
 	if fileGlob != "" {
 		args = append(args, "-g", fileGlob)
 	}
+	if ctx > 0 {
+		// -C makes rg print "--" between disjoint groups and render context
+		// lines as "path-line-content" (hyphen) vs matches "path:line:content"
+		args = append(args, "-C", strconv.Itoa(ctx))
+	}
 	args = append(args, "-e", pattern, "--", resolvePath(path))
-	ctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
+	rctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, rg(), args...)
+	cmd := exec.CommandContext(rctx, rg(), args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &limitedWriter{w: &stdout, max: maxOut}
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
+	if rctx.Err() == context.DeadlineExceeded {
 		return jerr(fmt.Sprintf("rg timed out after %ds", int(searchTimeout.Seconds())))
 	}
 	if err != nil {
@@ -488,7 +507,7 @@ func searchRg(pattern, path, fileGlob string, caseSensitive bool, limit, offset 
 			return jerr("rg error: " + msg)
 		}
 	}
-	return collectHits(stdout.String(), "rg", limit, offset)
+	return collectHitsRg(stdout.String(), "rg", limit, offset, ctx)
 }
 
 type limitedWriter struct {
@@ -513,40 +532,195 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 // (co:lon/f.txt:1:hit), which SplitN(3) parsed wrong.
 var hitLineRx = regexp.MustCompile(`^(.+?):(\d+):(.*)$`)
 
+// collectHits parses rg output for context=0 searches; it is byte-identical
+// to the pre-context build (every non-empty row counts toward total_hits).
 func collectHits(out, engine string, limit, offset int) string {
-	type hit struct {
-		Path    string `json:"path"`
-		Line    int    `json:"line"`
-		Content string `json:"content"`
+	return collectHitsRg(out, engine, limit, offset, 0)
+}
+
+type searchHit struct {
+	Path    string `json:"path"`
+	Line    int    `json:"line"`
+	Content string `json:"content"`
+	Context string `json:"context,omitempty"`
+}
+
+func envelopeHits(engine string, hits []searchHit, total, offset int, truncated bool) string {
+	return jmap(map[string]any{
+		"success": true, "engine": engine, "hits": hits,
+		"total_hits": total, "shown": len(hits),
+		"truncated": truncated || total > offset+len(hits)})
+}
+
+// collectHitsRg parses rg's --line-number --no-heading output. With ctx==0
+// only "path:line:content" match rows exist and every non-empty row counts
+// (legacy behavior, garbage included). With ctx>0 rg also emits "--" group
+// separators and "path-line-content" context rows: only match rows count
+// toward total_hits; context rows render into a gutter string on the hit —
+// "N-line" for lines before the match, "N+line" for lines after it.
+//
+// The path/context separator is ambiguous ("a-1-b.txt-4-ctx" splits as
+// path="a-1-b.txt" line=4, and content may itself contain "-N-"), so every
+// context row is decomposed into ALL plausible "-digits-" splits from the
+// right, and the split consistent with the neighboring match's line number
+// is chosen once that match is seen.
+func collectHitsRg(out, engine string, limit, offset, ctx int) string {
+	if ctx == 0 {
+		hits := []searchHit{}
+		total := 0
+		for _, raw := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+			if raw == "" {
+				continue
+			}
+			total++
+			if total <= offset || len(hits) >= limit {
+				continue
+			}
+			m := hitLineRx.FindStringSubmatch(raw)
+			if m == nil {
+				continue
+			}
+			no, _ := strconv.Atoi(m[2])
+			content := m[3]
+			if len(content) > maxLine {
+				content = content[:maxLine] + "... [truncated]"
+			}
+			hits = append(hits, searchHit{Path: m[1], Line: no, Content: content})
+		}
+		return envelopeHits(engine, hits, total, offset, false)
 	}
-	hits := []hit{}
+
+	hits := []searchHit{}
 	total := 0
+	before := []ctxCandSet{} // context rows awaiting their match (after "--")
+	afterOpen := false       // context rows attach to the last hit as after-lines
 	for _, raw := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
 		if raw == "" {
 			continue
 		}
-		total++
-		if total <= offset || len(hits) >= limit {
+		if raw == "--" {
+			before = nil
+			afterOpen = false
 			continue
 		}
 		m := hitLineRx.FindStringSubmatch(raw)
 		if m == nil {
+			cands := ctxCandidates(raw)
+			if len(cands) == 0 {
+				continue
+			}
+			if afterOpen && len(hits) > 0 {
+				// after-line: smallest line number still above the last hit
+				pick := pickCtxCand(cands, hits[len(hits)-1].Line, false)
+				hits[len(hits)-1].Context = joinCtx(hits[len(hits)-1].Context,
+					strconv.Itoa(pick.no)+"+"+clampLine(pick.content))
+			} else {
+				before = append(before, ctxCandSet{cands: cands})
+			}
+			continue
+		}
+		total++
+		kept := total > offset && len(hits) < limit
+		if !kept {
+			before = nil
+			afterOpen = false
 			continue
 		}
 		no, _ := strconv.Atoi(m[2])
-		content := m[3]
-		if len(content) > maxLine {
-			content = content[:maxLine] + "... [truncated]"
+		content := clampLine(m[3])
+		h := searchHit{Path: m[1], Line: no, Content: content}
+		if len(before) > 0 {
+			// before-lines sit directly above this match: take the largest
+			// candidate line number still below it
+			rows := make([]string, 0, len(before))
+			for _, p := range before {
+				pick := pickCtxCand(p.cands, no, true)
+				rows = append(rows, strconv.Itoa(pick.no)+"-"+clampLine(pick.content))
+			}
+			h.Context = strings.Join(rows, "\n")
+			before = nil
 		}
-		hits = append(hits, hit{m[1], no, content})
+		hits = append(hits, h)
+		afterOpen = true
 	}
-	return jmap(map[string]any{
-		"success": true, "engine": engine, "hits": hits,
-		"total_hits": total, "shown": len(hits),
-		"truncated": total > offset+len(hits)})
+	return envelopeHits(engine, hits, total, offset, false)
 }
 
-func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offset int) string {
+type ctxCand struct {
+	no      int
+	content string
+}
+
+type ctxCandSet struct {
+	cands []ctxCand
+}
+
+// ctxCandidates decomposes "path-line-content" into every plausible split
+// where a hyphen preceded by digits ends the path, rightmost first. The
+// rightmost split is the usual case (".../file-12-text" -> line 12); the
+// rest cover paths containing "-N-" segments.
+func ctxCandidates(raw string) []ctxCand {
+	var out []ctxCand
+	for i := len(raw) - 1; i > 0; i-- {
+		if raw[i] != '-' {
+			continue
+		}
+		j := i - 1
+		for j >= 0 && raw[j] >= '0' && raw[j] <= '9' {
+			j--
+		}
+		if j == i-1 { // no digits before this hyphen
+			continue
+		}
+		no, err := strconv.Atoi(raw[j+1 : i])
+		if err != nil || no < 1 {
+			continue
+		}
+		out = append(out, ctxCand{no, raw[i+1:]})
+		if len(out) >= 8 {
+			break
+		}
+	}
+	return out
+}
+
+// pickCtxCand chooses the split consistent with the neighbor line L: before
+// context takes the largest candidate below L, after context the smallest
+// above L. Falls back to the first (rightmost) candidate when nothing fits.
+func pickCtxCand(cands []ctxCand, line int, before bool) ctxCand {
+	best := -1
+	for i, c := range cands {
+		if before && c.no < line || !before && c.no > line {
+			if best < 0 {
+				best = i
+				continue
+			}
+			if before && c.no > cands[best].no || !before && c.no < cands[best].no {
+				best = i
+			}
+		}
+	}
+	if best < 0 {
+		return cands[0]
+	}
+	return cands[best]
+}
+
+func clampLine(s string) string {
+	if len(s) > maxLine {
+		return s[:maxLine] + "... [truncated]"
+	}
+	return s
+}
+
+func joinCtx(existing, row string) string {
+	if existing == "" {
+		return row
+	}
+	return existing + "\n" + row
+}
+
+func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offset, ctx int) string {
 	pat := pattern
 	if !caseSensitive {
 		pat = "(?i)" + pat
@@ -556,12 +730,7 @@ func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offse
 		return jerr(fmt.Sprintf("invalid regex: %v", err))
 	}
 	root := resolvePath(path)
-	type hit struct {
-		Path    string `json:"path"`
-		Line    int    `json:"line"`
-		Content string `json:"content"`
-	}
-	hits := []hit{}
+	hits := []searchHit{}
 	total := 0
 	deadline := time.Now().Add(searchTimeout)
 	timedOut := false
@@ -603,35 +772,260 @@ func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offse
 		if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(raw) {
 			return nil
 		}
-		for no, line := range splitLines(raw) {
-			if rx.MatchString(line) {
-				total++
-				if total > offset && len(hits) < limit {
-					if len(line) > maxLine {
-						line = line[:maxLine] + "... [truncated]"
-					}
-					hits = append(hits, hit{fp, no + 1, line})
+		fileLines := splitLines(raw)
+		for i, line := range fileLines {
+			if !rx.MatchString(line) {
+				continue
+			}
+			total++
+			if total <= offset || len(hits) >= limit {
+				continue
+			}
+			content := line
+			if len(content) > maxLine {
+				content = content[:maxLine] + "... [truncated]"
+			}
+			h := searchHit{Path: fp, Line: i + 1, Content: content}
+			if ctx > 0 {
+				// same gutter format as the rg engine: "N-line" before,
+				// "N+line" after, clamped like match lines
+				var gutter []string
+				lo := i - ctx
+				if lo < 0 {
+					lo = 0
+				}
+				hi := i + ctx + 1
+				if hi > len(fileLines) {
+					hi = len(fileLines)
+				}
+				for j := lo; j < i; j++ {
+					gutter = append(gutter, ctxRow(j+1, fileLines[j], "-"))
+				}
+				for j := i + 1; j < hi; j++ {
+					gutter = append(gutter, ctxRow(j+1, fileLines[j], "+"))
+				}
+				if len(gutter) > 0 {
+					h.Context = strings.Join(gutter, "\n")
 				}
 			}
+			hits = append(hits, h)
 		}
 		return nil
 	})
-	return jmap(map[string]any{
-		"success": true, "engine": "walk", "hits": hits,
-		"total_hits": total, "shown": len(hits),
-		"truncated": timedOut || total > offset+len(hits)})
+	return envelopeHits("walk", hits, total, offset, timedOut)
 }
 
-func fastSearch(pattern, path, fileGlob string, caseSensitive bool, limit, offset int) string {
+// ctxRow renders one context-gutter row, clamped like match lines.
+func ctxRow(no int, line, sep string) string {
+	if len(line) > maxLine {
+		line = line[:maxLine] + "... [truncated]"
+	}
+	return strconv.Itoa(no) + sep + line
+}
+
+func fastSearch(pattern, path, fileGlob string, caseSensitive bool, limit, offset, ctx int) string {
 	if pattern == "" {
 		return jerr("pattern must be a non-empty string (ripgrep regex syntax)")
 	}
 	limit, offset = clampLimitOffset(limit, offset)
+	ctx = clampCtx(ctx)
 	bump("fast_search")
 	if useSearch && rg() != "" {
-		return searchRg(pattern, path, fileGlob, caseSensitive, limit, offset)
+		return searchRg(pattern, path, fileGlob, caseSensitive, limit, offset, ctx)
 	}
-	return searchWalk(pattern, path, fileGlob, caseSensitive, limit, offset)
+	return searchWalk(pattern, path, fileGlob, caseSensitive, limit, offset, ctx)
+}
+
+// ------------------------------------------------------------- batch_search
+
+type searchOp struct {
+	Pattern       string `json:"pattern"`
+	Path          string `json:"path"`
+	FileGlob      string `json:"file_glob"`
+	CaseSensitive *bool  `json:"case_sensitive"`
+	Context       *int   `json:"context"`
+	Limit         *int   `json:"limit"`
+	Offset        *int   `json:"offset"`
+}
+
+func (o searchOp) run() string {
+	cs := true
+	if o.CaseSensitive != nil {
+		cs = *o.CaseSensitive
+	}
+	lim, off := 100, 0
+	if o.Limit != nil {
+		lim = *o.Limit
+	}
+	if o.Offset != nil {
+		off = *o.Offset
+	}
+	ctx := 0
+	if o.Context != nil {
+		ctx = *o.Context
+	}
+	return fastSearch(o.Pattern, o.Path, o.FileGlob, cs, lim, off, ctx)
+}
+
+func batchSearch(ops []searchOp) string {
+	if !useParallel {
+		return jerr("TOOLRUSH_PARALLEL=0 — lane disabled; issue individual searches")
+	}
+	if len(ops) == 0 {
+		return jerr("ops must be a non-empty list of {pattern, path, file_glob?, " +
+			"case_sensitive?, context?, limit?, offset?}")
+	}
+	if len(ops) > batchMax {
+		return jerr(fmt.Sprintf("batch too large: %d > %d — split it", len(ops), batchMax))
+	}
+	for i, op := range ops {
+		if op.Pattern == "" {
+			return jerr(fmt.Sprintf("op %d invalid: each op needs a non-empty string 'pattern'", i))
+		}
+		if op.Path == "" {
+			return jerr(fmt.Sprintf("op %d invalid: each op needs a non-empty string 'path'", i))
+		}
+	}
+	bump("batch_search")
+	// The opposite of batch_read's serial-by-design: each op spawns its own
+	// rg process and searches are process/IO-bound, so fan out — the batch
+	// wall time approaches the slowest op, not the sum. Results embedded raw
+	// (no double encode), input order preserved, per-op failures isolated
+	// (that op's result is an error envelope, the rest still succeed).
+	results := make([]string, len(ops))
+	var wg sync.WaitGroup
+	for i, op := range ops {
+		wg.Add(1)
+		go func(i int, op searchOp) {
+			defer wg.Done()
+			results[i] = op.run()
+		}(i, op)
+	}
+	wg.Wait()
+	raw := make([]json.RawMessage, len(results))
+	for i, r := range results {
+		raw[i] = json.RawMessage(r)
+	}
+	out, _ := json.Marshal(map[string]any{"success": true, "results": raw})
+	return string(out)
+}
+
+// ---------------------------------------------------------------- fast_tree
+
+var treeSkipNames = map[string]bool{
+	".git": true, "node_modules": true, "__pycache__": true, ".venv": true,
+	"target": true, "dist": true, "build": true,
+}
+
+// treeSkip is the shared fast_tree skip list: exact names plus anything
+// ending in "_cache" (".pytest_cache", "my_cache", ...).
+func treeSkip(name string) bool {
+	return treeSkipNames[name] || strings.HasSuffix(name, "_cache")
+}
+
+type treeEntry struct {
+	Path  string `json:"path"`
+	IsDir bool   `json:"is_dir"`
+	Size  int64  `json:"size"`
+	Mtime int64  `json:"mtime"` // unix seconds
+}
+
+func fastTree(path string, maxDepth, maxEntries int, pattern string) string {
+	if !useFastlane {
+		return jerr("TOOLRUSH_FASTLANE=0 — lane disabled; use the harness's native listing")
+	}
+	root := resolvePath(path)
+	st, err := os.Stat(root)
+	if err != nil || !st.IsDir() {
+		return jerr(fmt.Sprintf("Directory not found: %s", path))
+	}
+	if maxDepth < 1 {
+		maxDepth = 1
+	}
+	if maxDepth > 10 {
+		maxDepth = 10
+	}
+	if maxEntries < 1 {
+		maxEntries = 1
+	}
+	if maxEntries > 5000 {
+		maxEntries = 5000
+	}
+	bump("fast_tree")
+	entries := []treeEntry{}
+	truncated := false
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		ents, err := os.ReadDir(dir) // sorted by name
+		if err != nil {
+			return
+		}
+		// deterministic dirs-first, alphabetical within the directory
+		dirs := []os.DirEntry{}
+		ordered := make([]os.DirEntry, 0, len(ents))
+		for _, e := range ents {
+			if e.IsDir() {
+				dirs = append(dirs, e)
+			} else {
+				ordered = append(ordered, e)
+			}
+		}
+		ordered = append(dirs, ordered...)
+		// pass 1: list this directory's entries (depth budget already
+		// enforced by the descent guard — we only get here within budget)
+		for _, e := range ordered {
+			if truncated {
+				return
+			}
+			name := e.Name()
+			if treeSkip(name) {
+				continue
+			}
+			if pattern != "" {
+				if ok, _ := filepath.Match(pattern, name); !ok {
+					continue // filtered out, but dirs are still descended into
+				}
+			}
+			fi, err := e.Info()
+			if err != nil {
+				continue
+			}
+			entries = append(entries, treeEntry{
+				Path:  filepath.Join(dir, name),
+				IsDir: e.IsDir(),
+				Size:  fi.Size(),
+				Mtime: fi.ModTime().Unix(),
+			})
+			if len(entries) >= maxEntries {
+				truncated = true
+				return
+			}
+		}
+		// pass 2: descend into child dirs (children of the root are depth 1,
+		// so a dir listed at `depth` is descended only when depth < maxDepth)
+		if truncated || depth >= maxDepth {
+			return
+		}
+		for _, e := range dirs {
+			if treeSkip(e.Name()) {
+				continue
+			}
+			walk(filepath.Join(dir, e.Name()), depth+1)
+			if truncated {
+				return
+			}
+		}
+	}
+	walk(root, 1)
+	d := map[string]any{
+		"success": true, "entries": entries,
+		"total": len(entries), "truncated": truncated,
+	}
+	if truncated {
+		d["hint"] = fmt.Sprintf("max_entries=%d reached — narrow with pattern= "+
+			"or a more specific path", maxEntries)
+	}
+	return jmap(d)
 }
 
 // --------------------------------------------------------------- warm_exec
@@ -1004,16 +1398,56 @@ func init() {
 		{"name": "fast_search",
 			"description": desc("Content search via direct ripgrep transport (respects " +
 				".gitignore, real regex grammar). Falls back to a pure walk " +
-				"when rg is unavailable."),
+				"when rg is unavailable. context=N (0-5) adds N lines of " +
+				"gutter around each hit: \"L-line\" before, \"L+line\" after."),
 			"inputSchema": map[string]any{"type": "object",
 				"properties": map[string]any{
 					"pattern":        map[string]any{"type": "string"},
 					"path":           map[string]any{"type": "string"},
 					"file_glob":      map[string]any{"type": "string"},
 					"case_sensitive": map[string]any{"type": "boolean", "default": true},
+					"context":        map[string]any{"type": "integer", "default": 0},
 					"limit":          map[string]any{"type": "integer", "default": 100},
 					"offset":         map[string]any{"type": "integer", "default": 0}},
 				"required": []string{"pattern", "path"}}},
+		{"name": "batch_search",
+			"description": desc("Run 1-16 content searches in ONE call, fanned out " +
+				"across goroutines — each op spawns its own rg process, so " +
+				"the batch wall time approaches the slowest op, not the sum " +
+				"(unlike batch_read, serial by design). Input order " +
+				"preserved; the whole batch is validated before anything " +
+				"runs; per-op failures are isolated. Each op: {pattern, " +
+				"path, file_glob?, case_sensitive?, context?, limit?, " +
+				"offset?}."),
+			"inputSchema": map[string]any{"type": "object",
+				"properties": map[string]any{
+					"ops": map[string]any{"type": "array", "items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"pattern":        map[string]any{"type": "string"},
+							"path":           map[string]any{"type": "string"},
+							"file_glob":      map[string]any{"type": "string"},
+							"case_sensitive": map[string]any{"type": "boolean"},
+							"context":        map[string]any{"type": "integer"},
+							"limit":          map[string]any{"type": "integer"},
+							"offset":         map[string]any{"type": "integer"}},
+						"required": []string{"pattern", "path"}}}},
+				"required": []string{"ops"}}},
+		{"name": "fast_tree",
+			"description": desc("Budgeted directory listing: deterministic " +
+				"dirs-first, alphabetical order; depth (1-10, default 3) and " +
+				"entry (1-5000, default 500) budgets; optional basename " +
+				"pattern filter (dirs matching it are still descended). " +
+				"Skips .git, node_modules, __pycache__, .venv, target, " +
+				"dist, build and *_cache. No .gitignore parsing — use " +
+				"pattern= to narrow."),
+			"inputSchema": map[string]any{"type": "object",
+				"properties": map[string]any{
+					"path":        map[string]any{"type": "string"},
+					"max_depth":   map[string]any{"type": "integer", "default": 3},
+					"max_entries": map[string]any{"type": "integer", "default": 500},
+					"pattern":     map[string]any{"type": "string"}},
+				"required": []string{"path"}}},
 		{"name": "warm_exec",
 			"description": desc("Run a shell command on ONE persistent bash: cwd, " +
 				"exports and shell state survive across calls (unlike " +
@@ -1185,6 +1619,7 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			Path          string `json:"path"`
 			FileGlob      string `json:"file_glob"`
 			CaseSensitive *bool  `json:"case_sensitive"`
+			Context       *int   `json:"context"`
 			Limit         *int   `json:"limit"`
 			Offset        *int   `json:"offset"`
 		}
@@ -1202,7 +1637,39 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 		if a.Offset != nil {
 			off = *a.Offset
 		}
-		r := fastSearch(a.Pattern, a.Path, a.FileGlob, cs, lim, off)
+		ctx := 0
+		if a.Context != nil {
+			ctx = *a.Context
+		}
+		r := fastSearch(a.Pattern, a.Path, a.FileGlob, cs, lim, off, ctx)
+		return r, envIsError(r), false
+	case "batch_search":
+		var a struct {
+			Ops []searchOp `json:"ops"`
+		}
+		if err := json.Unmarshal(args, &a); err != nil {
+			return jerr("ops must be a non-empty list of {pattern, path, file_glob?, case_sensitive?, context?, limit?, offset?}"), true, false
+		}
+		r := batchSearch(a.Ops)
+		return r, envIsError(r), false
+	case "fast_tree":
+		var a struct {
+			Path       string `json:"path"`
+			MaxDepth   *int   `json:"max_depth"`
+			MaxEntries *int   `json:"max_entries"`
+			Pattern    string `json:"pattern"`
+		}
+		if err := json.Unmarshal(args, &a); err != nil || a.Path == "" {
+			return jerr("path must be a non-empty string"), true, false
+		}
+		depth, entries := 3, 500
+		if a.MaxDepth != nil {
+			depth = *a.MaxDepth
+		}
+		if a.MaxEntries != nil {
+			entries = *a.MaxEntries
+		}
+		r := fastTree(a.Path, depth, entries, a.Pattern)
 		return r, envIsError(r), false
 	case "warm_exec":
 		var a struct {

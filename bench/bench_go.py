@@ -102,6 +102,44 @@ def bench_head_of_line(cmd):
     return fast_read_wait
 
 
+_id = [0]
+
+
+def rpc_id():
+    _id[0] += 1
+    return _id[0]
+
+
+def bench_batch_search(cmd, n=10):
+    """6 content searches over a real tree: ONE batch_search call (the Go
+    server fans the ops out across goroutines) vs 6 sequential fast_search
+    calls. Median of n. Returns (parallel_ms, sequential_ms)."""
+    root = "/usr/share/doc" if os.path.isdir("/usr/share/doc") else ROOT
+    pats = ["copyright", "license", "version", "software", "warranty",
+            "redistribution"]
+    ops = [{"pattern": p, "path": root, "limit": 20} for p in pats]
+    srv = spawn(cmd)
+    rpc(srv, rpc_id(), "initialize")
+    # warmup: rg path discovery, page caches
+    rpc(srv, rpc_id(), "tools/call",
+        {"name": "batch_search", "arguments": {"ops": ops}})
+    for op in ops:
+        rpc(srv, rpc_id(), "tools/call", {"name": "fast_search", "arguments": op})
+    par, seq = [], []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        rpc(srv, rpc_id(), "tools/call",
+            {"name": "batch_search", "arguments": {"ops": ops}})
+        par.append((time.perf_counter() - t0) * 1000)
+        t0 = time.perf_counter()
+        for op in ops:
+            rpc(srv, rpc_id(), "tools/call",
+                {"name": "fast_search", "arguments": op})
+        seq.append((time.perf_counter() - t0) * 1000)
+    srv.stdin.close(); srv.wait(timeout=5)
+    return statistics.median(par), statistics.median(seq)
+
+
 def main():
     print(f"{'':24}{'python':>10}{'go':>10}{'C':>10}")
     print(f"{'startup+init (ms)':24}{bench_startup(PY):>10.2f}{bench_startup(GO):>10.2f}{bench_startup(C):>10.2f}")
@@ -109,6 +147,16 @@ def main():
     print(f"{'doctor RTT (ms)':24}{bench_rtt(PY, 'tools/call', {'name': 'doctor', 'arguments': {}}):>10.3f}{bench_rtt(GO, 'tools/call', {'name': 'doctor', 'arguments': {}}):>10.3f}{'-':>10}")
     print(f"{'cold batch 16x1000 (ms)':24}{bench_cold_batch(PY):>10.2f}{bench_cold_batch(GO):>10.2f}{'-':>10}")
     print(f"{'read during 2s exec (ms)':24}{bench_head_of_line(PY):>10.2f}{bench_head_of_line(GO):>10.2f}{'-':>10}")
+
+    root = "/usr/share/doc" if os.path.isdir("/usr/share/doc") else ROOT
+    print(f"\nbatch_search: 6 searches over {root} (median of 10, ms)")
+    pp, ps = bench_batch_search(PY)
+    gp, gs = bench_batch_search(GO)
+    print(f"  parallel   (1 batch_search call)  python {pp:>7.2f}   go {gp:>7.2f}")
+    print(f"  sequential (6 fast_search calls)  python {ps:>7.2f}   go {gs:>7.2f}")
+    print(f"  parallel speedup: go {gs / gp:.2f}x, python {ps / pp:.2f}x "
+          f"(python reference runs its ops sequentially — its win is 1 RPC, "
+          f"the Go win is real process parallelism)")
 
 
 if __name__ == "__main__":

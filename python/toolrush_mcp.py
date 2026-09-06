@@ -16,7 +16,17 @@ portable; the lanes are. This server exposes them as MCP tools over stdio:
                 files, real regex grammar — v2's "one engine, accelerated
                 transport"). Fallback / negative control: pure-Python walk
                 (port of toolrush_search.py) when rg is missing or
-                TOOLRUSH_SEARCH=0.
+                TOOLRUSH_SEARCH=0. context=N adds N lines of gutter around
+                each hit ("L-line" before, "L+line" after).
+  batch_search  1..16 searches through ONE call, order-preserving, whole
+                batch validated before dispatch, per-op error isolation.
+                The Go server fans the ops out in parallel goroutines
+                (each op spawns its own rg); this reference runs them
+                SEQUENTIALLY — the win here is one MCP call, not in-process
+                parallelism (mirrors batch_read's measured-serial design).
+  fast_tree     budgeted directory listing: deterministic dirs-first
+                alphabetical walk, depth/entry budgets, basename pattern
+                filter, shared skip list. No .gitignore parsing.
   warm_exec     ONE persistent bash (--noprofile --norc), per-call unique
                 frame markers, rc capture, cwd/exports survive across calls,
                 process-group kill on timeout, NEVER retries a submitted
@@ -47,7 +57,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 USE_FASTLANE = os.environ.get("TOOLRUSH_FASTLANE", "1") == "1"
 USE_SEARCH = os.environ.get("TOOLRUSH_SEARCH", "1") == "1"
@@ -70,7 +80,8 @@ WALK_MAX_FILE = 16 * 1024 * 1024    # walk fallback refuses to read past this
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico")
 SKIP_SUFFIXES = IMAGE_SUFFIXES + (".pyc", ".pyo")
 
-_STATS = {"fast_read": 0, "batch_read": 0, "fast_search": 0, "warm_exec": 0,
+_STATS = {"fast_read": 0, "batch_read": 0, "fast_search": 0, "batch_search": 0,
+          "fast_tree": 0, "warm_exec": 0,
           "batch_exec": 0, "cache_hits": 0, "shell_respawns": 0}
 
 
@@ -313,6 +324,14 @@ _RGVER = None
 _HIT_LINE_RX = re.compile(r"^(.+?):(\d+):(.*)$")
 
 
+def _clamp_ctx(c):
+    try:
+        c = int(c)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(c, 5))
+
+
 def _rg():
     global _RG
     if _RG is None:
@@ -324,13 +343,16 @@ def _rg():
     return _RG
 
 
-def _search_rg(pattern, path, file_glob, case_sensitive, limit, offset):
-    cmd = [_rg(), "--line-number", "--no-heading", "--color", "never",
-           "--encoding", "utf-8"]
+def _search_rg(pattern, path, file_glob, case_sensitive, limit, offset,
+               context=0):
+    cmd = [_rg(), "--line-number", "--no-heading", "--with-filename",
+           "--color", "never", "--encoding", "utf-8"]
     if not case_sensitive:
         cmd.append("-i")
     if file_glob:
         cmd += ["-g", file_glob]
+    if context > 0:
+        cmd += ["-C", str(context)]
     cmd += ["-e", pattern, "--", str(_resolve(path))]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=SEARCH_TIMEOUT)
@@ -338,9 +360,12 @@ def _search_rg(pattern, path, file_glob, case_sensitive, limit, offset):
         return _err(f"rg timed out after {SEARCH_TIMEOUT}s")
     if r.returncode == 2:
         return _err("rg error: " + r.stderr.decode("utf-8", "replace")[:500])
+    text = r.stdout.decode("utf-8", "replace")
+    if context > 0:
+        return _collect_hits_ctx(text, "rg", limit, offset)
     hits = []
     total = 0
-    for raw in r.stdout.decode("utf-8", "replace").splitlines():
+    for raw in text.splitlines():
         if not raw:
             continue
         total += 1
@@ -359,9 +384,118 @@ def _search_rg(pattern, path, file_glob, case_sensitive, limit, offset):
                "truncated": total > offset + len(hits)})
 
 
-def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset):
+def _clamp_line(s):
+    return s[:MAX_LINE] + "... [truncated]" if len(s) > MAX_LINE else s
+
+
+def _ctx_candidates(raw):
+    """Decompose "path-line-content" into every plausible split where a
+    hyphen preceded by digits ends the path, rightmost first. The rightmost
+    split is the usual case (".../file-12-text" -> line 12); the rest cover
+    paths containing "-N-" segments. The split consistent with the
+    neighboring match's line number is chosen once that match is seen."""
+    out = []
+    for i in range(len(raw) - 1, 0, -1):
+        if raw[i] != "-":
+            continue
+        j = i - 1
+        while j >= 0 and raw[j].isdigit():
+            j -= 1
+        if j == i - 1:  # no digits before this hyphen
+            continue
+        try:
+            no = int(raw[j + 1:i])
+        except ValueError:
+            continue
+        if no < 1:
+            continue
+        out.append((no, raw[i + 1:]))
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _pick_ctx_cand(cands, line, before):
+    """Choose the split consistent with the neighbor line: before context
+    takes the largest candidate below the match, after context the smallest
+    above the last hit. Falls back to the first (rightmost) candidate."""
+    best = None
+    for c in cands:
+        if (before and c[0] < line) or (not before and c[0] > line):
+            if best is None:
+                best = c
+            elif (before and c[0] > best[0]) or (not before and c[0] < best[0]):
+                best = c
+    return best if best is not None else cands[0]
+
+
+def _collect_hits_ctx(out, engine, limit, offset):
+    """Parse rg -C output: "--" separates disjoint groups; match rows are
+    "path:line:content", context rows "path-line-content". Only match rows
+    count toward total_hits. Context rows render into a gutter string on the
+    hit: "N-line" before the match, "N+line" after."""
+    hits = []
+    total = 0
+    before = []        # context rows awaiting their match (after a "--")
+    after_open = False # context rows attach to the last hit as after-lines
+    for raw in out.splitlines():
+        if not raw:
+            continue
+        if raw == "--":
+            before = []
+            after_open = False
+            continue
+        m = _HIT_LINE_RX.match(raw)
+        if m is None:
+            cands = _ctx_candidates(raw)
+            if not cands:
+                continue
+            if after_open and hits:
+                # after-line: smallest line number still above the last hit
+                no, line = _pick_ctx_cand(cands, hits[-1]["line"], False)
+                hits[-1]["_ctx"].append(f"{no}+{_clamp_line(line)}")
+            else:
+                before.append(cands)
+            continue
+        total += 1
+        if total <= offset or len(hits) >= limit:
+            before = []
+            after_open = False
+            continue
+        h = {"path": m.group(1), "line": int(m.group(2)),
+             "content": _clamp_line(m.group(3)), "_ctx": []}
+        if before:
+            # before-lines sit directly above this match: take the largest
+            # candidate line number still below it
+            rows = []
+            for cands in before:
+                no, line = _pick_ctx_cand(cands, h["line"], True)
+                rows.append(f"{no}-{_clamp_line(line)}")
+            h["_ctx"] = rows
+            before = []
+        hits.append(h)
+        after_open = True
+    for h in hits:
+        ctx = h.pop("_ctx")
+        if ctx:
+            h["context"] = "\n".join(ctx)
+    return _j({"success": True, "engine": engine, "hits": hits,
+               "total_hits": total, "shown": len(hits),
+               "truncated": total > offset + len(hits)})
+
+
+def _ctx_row(no, line, sep):
+    if len(line) > MAX_LINE:
+        line = line[:MAX_LINE] + "... [truncated]"
+    return f"{no}{sep}{line}"
+
+
+def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset,
+                 context=0):
     """Pure-Python fallback (port of toolrush_search.py): deterministic sorted
-    walk, null-byte binary sniff, utf-8-sig decode."""
+    walk, null-byte binary sniff, utf-8-sig decode. context=N emits the same
+    "N-line"/"N+line" gutter as the rg engine, collected from the same
+    file's lines around each match."""
     import fnmatch
     flags = 0 if case_sensitive else re.IGNORECASE
     try:
@@ -373,7 +507,10 @@ def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset):
     total = 0
     timed_out = False
     deadline = time.monotonic() + SEARCH_TIMEOUT
-    for dirpath, dirnames, filenames in os.walk(root):
+    # parity with the Go WalkDir engine: a single-file root is searched
+    walk_iter = ([(str(root.parent), [], [root.name])] if root.is_file()
+                 else os.walk(root))
+    for dirpath, dirnames, filenames in walk_iter:
         dirnames.sort()
         if ".git" in dirnames:
             dirnames.remove(".git")
@@ -398,13 +535,25 @@ def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset):
                 text = raw.decode("utf-8-sig")
             except UnicodeDecodeError:
                 continue
-            for no, line in enumerate(text.splitlines(), start=1):
-                if rx.search(line):
-                    total += 1
-                    if total > offset and len(hits) < limit:
-                        if len(line) > MAX_LINE:
-                            line = line[:MAX_LINE] + "... [truncated]"
-                        hits.append({"path": str(fp), "line": no, "content": line})
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if not rx.search(line):
+                    continue
+                total += 1
+                if total <= offset or len(hits) >= limit:
+                    continue
+                content = line[:MAX_LINE] + "... [truncated]" \
+                    if len(line) > MAX_LINE else line
+                h = {"path": str(fp), "line": i + 1, "content": content}
+                if context > 0:
+                    gutter = []
+                    for j in range(max(0, i - context), i):
+                        gutter.append(_ctx_row(j + 1, lines[j], "-"))
+                    for j in range(i + 1, min(len(lines), i + 1 + context)):
+                        gutter.append(_ctx_row(j + 1, lines[j], "+"))
+                    if gutter:
+                        h["context"] = "\n".join(gutter)
+                hits.append(h)
         if timed_out:
             break
     return _j({"success": True, "engine": "walk", "hits": hits,
@@ -413,16 +562,138 @@ def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset):
 
 
 def fast_search(pattern, path, file_glob=None, case_sensitive=True,
-                limit=100, offset=0):
+                limit=100, offset=0, context=0):
     if not isinstance(pattern, str) or not pattern:
         return _err("pattern must be a non-empty string (ripgrep regex syntax)")
     limit = max(1, min(int(limit), 2000))
     offset = max(0, int(offset))
+    context = _clamp_ctx(context)
     _STATS["fast_search"] += 1
     if USE_SEARCH and _rg():
-        return _search_rg(pattern, path, file_glob, case_sensitive, limit, offset)
+        return _search_rg(pattern, path, file_glob, case_sensitive, limit,
+                          offset, context)
     # SEARCH=0 or rg missing -> pure-Python lane (negative control / fallback)
-    return _search_walk(pattern, path, file_glob, case_sensitive, limit, offset)
+    return _search_walk(pattern, path, file_glob, case_sensitive, limit,
+                        offset, context)
+
+
+# ------------------------------------------------------------- batch_search
+
+
+def _op_str(op, key):
+    v = op.get(key)
+    return v if isinstance(v, str) else ""
+
+
+def batch_search(ops):
+    """1..16 searches through ONE call. Order-preserving; whole batch
+    validated before anything runs — one bad op rejects all; per-op runtime
+    failures stay isolated in that op's result.
+
+    The Go server fans the ops out across goroutines (each op spawns its
+    own rg process and searches are process-bound, so parallel is the
+    point). This reference runs them SEQUENTIALLY: CPython's GIL plus
+    per-op rg subprocesses would make threads pure dispatch overhead here —
+    same measured-serial discipline as batch_read. The win either way is
+    ONE MCP call instead of N plus validation/isolation semantics."""
+    if not USE_PARALLEL:
+        return _err("TOOLRUSH_PARALLEL=0 — lane disabled; issue individual searches")
+    if not isinstance(ops, list) or not ops:
+        return _err("ops must be a non-empty list of {pattern, path, "
+                    "file_glob?, case_sensitive?, context?, limit?, offset?}")
+    if len(ops) > BATCH_MAX:
+        return _err(f"batch too large: {len(ops)} > {BATCH_MAX} — split it")
+    for i, op in enumerate(ops):
+        if not isinstance(op, dict) or not _op_str(op, "pattern"):
+            return _err(f"op {i} invalid: each op needs a non-empty string "
+                        f"'pattern'")
+        if not _op_str(op, "path"):
+            return _err(f"op {i} invalid: each op needs a non-empty string "
+                        f"'path'")
+    _STATS["batch_search"] += 1
+    results = []
+    for op in ops:
+        cs = op.get("case_sensitive")
+        results.append(fast_search(
+            op["pattern"], op["path"], _op_str(op, "file_glob") or None,
+            cs if isinstance(cs, bool) else True,
+            op.get("limit") if isinstance(op.get("limit"), int) else 100,
+            op.get("offset") if isinstance(op.get("offset"), int) else 0,
+            op.get("context") if isinstance(op.get("context"), int) else 0))
+    # Inner results are already valid JSON texts — embed raw, no re-escape.
+    return '{"success":true,"results":[' + ",".join(results) + "]}"
+
+
+# ---------------------------------------------------------------- fast_tree
+
+_TREE_SKIP = {".git", "node_modules", "__pycache__", ".venv",
+              "target", "dist", "build"}
+
+
+def _tree_skip(name):
+    return name in _TREE_SKIP or name.endswith("_cache")
+
+
+def fast_tree(path, max_depth=3, max_entries=500, pattern=None):
+    """Budgeted directory listing. Deterministic dirs-first, alphabetical
+    order; depth (1-10) and entry (1-5000) budgets; optional basename
+    pattern filter (fnmatch — a filtered-out dir is still descended into).
+    Shared skip list: .git, node_modules, __pycache__, .venv, target,
+    dist, build, *_cache. No .gitignore parsing."""
+    if not USE_FASTLANE:
+        return _err("TOOLRUSH_FASTLANE=0 — lane disabled; use the harness's "
+                    "native listing")
+    try:
+        max_depth = int(max_depth)
+        max_entries = int(max_entries)
+    except (TypeError, ValueError):
+        return _err("max_depth and max_entries must be integers")
+    root = _resolve(path)
+    if not root.is_dir():
+        return _err(f"Directory not found: {path}")
+    max_depth = max(1, min(max_depth, 10))
+    max_entries = max(1, min(max_entries, 5000))
+    _STATS["fast_tree"] += 1
+    import fnmatch
+    entries = []
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(root):
+        if truncated:
+            break
+        rel = os.path.relpath(dirpath, root)
+        # children of the root are depth 1
+        depth = 1 if rel == os.curdir else rel.count(os.sep) + 2
+        # prune: skip-listed dirs never appear nor get descended into
+        dirnames[:] = sorted(d for d in dirnames if not _tree_skip(d))
+        rows = [(name, True) for name in dirnames]
+        rows += [(name, False) for name in sorted(filenames)
+                 if not _tree_skip(name)]
+        for name, is_dir in rows:
+            if truncated:
+                break
+            if pattern and not fnmatch.fnmatch(name, pattern):
+                continue
+            fp = os.path.join(dirpath, name)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            entries.append({"path": fp, "is_dir": is_dir,
+                            "size": st.st_size, "mtime": int(st.st_mtime)})
+            if len(entries) >= max_entries:
+                truncated = True
+        # stop descending past the depth budget only AFTER this directory's
+        # entries were listed (its child dirs are depth+1, still in budget)
+        if depth >= max_depth:
+            dirnames[:] = []
+        if truncated:
+            break
+    d = {"success": True, "entries": entries, "total": len(entries),
+         "truncated": truncated}
+    if truncated:
+        d["hint"] = (f"max_entries={max_entries} reached — narrow with "
+                     f"pattern= or a more specific path")
+    return _j(d)
 
 
 # --------------------------------------------------------------- warm_exec
@@ -728,16 +999,56 @@ TOOLS = [
     {"name": "fast_search",
      "description": "Content search via direct ripgrep transport (respects "
                     ".gitignore, real regex grammar). Falls back to a "
-                    "pure-Python walk when rg is unavailable.",
+                    "pure-Python walk when rg is unavailable. context=N "
+                    "(0-5) adds N lines of gutter around each hit: "
+                    "\"L-line\" before, \"L+line\" after.",
      "inputSchema": {"type": "object",
                      "properties": {
                          "pattern": {"type": "string"},
                          "path": {"type": "string"},
                          "file_glob": {"type": "string"},
                          "case_sensitive": {"type": "boolean", "default": True},
+                         "context": {"type": "integer", "default": 0},
                          "limit": {"type": "integer", "default": 100},
                          "offset": {"type": "integer", "default": 0}},
                      "required": ["pattern", "path"]}},
+    {"name": "batch_search",
+     "description": "Run 1-16 content searches in ONE call, order-preserving; "
+                    "the whole batch is validated before anything runs and "
+                    "per-op failures are isolated. The Go server fans the "
+                    "ops out in parallel (each spawns its own rg); this "
+                    "reference runs them sequentially. Each op: {pattern, "
+                    "path, file_glob?, case_sensitive?, context?, limit?, "
+                    "offset?}.",
+     "inputSchema": {"type": "object",
+                     "properties": {
+                         "ops": {"type": "array",
+                                 "items": {"type": "object",
+                                           "properties": {
+                                               "pattern": {"type": "string"},
+                                               "path": {"type": "string"},
+                                               "file_glob": {"type": "string"},
+                                               "case_sensitive": {"type": "boolean"},
+                                               "context": {"type": "integer"},
+                                               "limit": {"type": "integer"},
+                                               "offset": {"type": "integer"}},
+                                           "required": ["pattern", "path"]}}},
+                     "required": ["ops"]}},
+    {"name": "fast_tree",
+     "description": "Budgeted directory listing: deterministic dirs-first, "
+                    "alphabetical order; depth (1-10, default 3) and entry "
+                    "(1-5000, default 500) budgets; optional basename "
+                    "pattern filter (dirs matching it are still descended). "
+                    "Skips .git, node_modules, __pycache__, .venv, target, "
+                    "dist, build and *_cache. No .gitignore parsing — use "
+                    "pattern= to narrow.",
+     "inputSchema": {"type": "object",
+                     "properties": {
+                         "path": {"type": "string"},
+                         "max_depth": {"type": "integer", "default": 3},
+                         "max_entries": {"type": "integer", "default": 500},
+                         "pattern": {"type": "string"}},
+                     "required": ["path"]}},
     {"name": "warm_exec",
      "description": "Run a shell command on ONE persistent bash: cwd, "
                     "exports and shell state survive across calls (unlike "
@@ -776,6 +1087,8 @@ _DISPATCH = {
     "fast_read": lambda a: fast_read(**a),
     "batch_read": lambda a: batch_read(**a),
     "fast_search": lambda a: fast_search(**a),
+    "batch_search": lambda a: batch_search(**a),
+    "fast_tree": lambda a: fast_tree(**a),
     "warm_exec": lambda a: warm_exec(**a),
     "batch_exec": lambda a: batch_exec(**a),
     "doctor": lambda a: doctor(),

@@ -514,3 +514,254 @@ func FuzzCollectHits(f *testing.F) {
 		}
 	})
 }
+
+// ------------------------------------------------------- rg context parsing
+
+func parseCtxHits(t *testing.T, s string, limit, offset int) []searchHit {
+	t.Helper()
+	m := mustJSON(t, collectHitsRg(s, "rg", limit, offset, 1))
+	var hits []searchHit
+	b, _ := json.Marshal(m["hits"])
+	if err := json.Unmarshal(b, &hits); err != nil {
+		t.Fatalf("hits not parseable: %v", err)
+	}
+	return hits
+}
+
+func TestCollectHitsRgContext(t *testing.T) {
+	t.Run("before and after gutter", func(t *testing.T) {
+		out := "f.txt-9-before\nf.txt:10:match\nf.txt-11-after\n"
+		hits := parseCtxHits(t, out, 10, 0)
+		if len(hits) != 1 || hits[0].Line != 10 || hits[0].Content != "match" {
+			t.Fatalf("hits = %+v", hits)
+		}
+		if hits[0].Context != "9-before\n11+after" {
+			t.Fatalf("context = %q", hits[0].Context)
+		}
+	})
+
+	t.Run("double dash separator opens a new group", func(t *testing.T) {
+		out := "f.txt:1:a\nf.txt-2-gap\n--\nf.txt-8-near\nf.txt:9:b\n"
+		hits := parseCtxHits(t, out, 10, 0)
+		if len(hits) != 2 {
+			t.Fatalf("hits = %+v", hits)
+		}
+		if hits[0].Context != "2+gap" {
+			t.Fatalf("hit0 context = %q", hits[0].Context)
+		}
+		// "8-near" follows the "--", so it belongs to the NEXT match
+		if hits[1].Context != "8-near" {
+			t.Fatalf("hit1 context = %q", hits[1].Context)
+		}
+	})
+
+	t.Run("context rows only counted for matches", func(t *testing.T) {
+		out := "f-1-x\nf:2:m1\nf-3-y\n--\nf-8-z\nf:9:m2\nf-10-w\n"
+		m := mustJSON(t, collectHitsRg(out, "rg", 10, 0, 2))
+		if m["total_hits"] != float64(2) || m["shown"] != float64(2) {
+			t.Fatalf("meta = %v", m)
+		}
+	})
+
+	t.Run("offset skips matches and their context", func(t *testing.T) {
+		out := "f:1:a\nf-2-x\n--\nf:9:b\nf-10-y\n"
+		hits := parseCtxHits(t, out, 10, 1)
+		if len(hits) != 1 || hits[0].Line != 9 || hits[0].Context != "10+y" {
+			t.Fatalf("hits = %+v", hits)
+		}
+	})
+
+	t.Run("multiple matches share one group gutter", func(t *testing.T) {
+		// rg merges overlapping groups: lines between two close matches are
+		// printed once, after the first match
+		out := "f:1:a\nf-2-shared\nf:3:b\nf-4-tail\n"
+		hits := parseCtxHits(t, out, 10, 0)
+		if len(hits) != 2 {
+			t.Fatalf("hits = %+v", hits)
+		}
+		if hits[0].Context != "2+shared" {
+			t.Fatalf("hit0 context = %q", hits[0].Context)
+		}
+		if hits[1].Context != "4+tail" {
+			t.Fatalf("hit1 context = %q", hits[1].Context)
+		}
+	})
+
+	t.Run("hyphen-digit path names resolve via prefix strip", func(t *testing.T) {
+		out := "a-1-b.txt-4-ctx\na-1-b.txt:5:hit\n"
+		hits := parseCtxHits(t, out, 10, 0)
+		if len(hits) != 1 || hits[0].Path != "a-1-b.txt" {
+			t.Fatalf("hits = %+v", hits)
+		}
+		if hits[0].Context != "4-ctx" {
+			t.Fatalf("context = %q", hits[0].Context)
+		}
+	})
+
+	t.Run("no context field when a hit has none", func(t *testing.T) {
+		out := "f:1:a\n--\nf:9:b\n"
+		hits := parseCtxHits(t, out, 10, 0)
+		if len(hits) != 2 || hits[0].Context != "" || hits[1].Context != "" {
+			t.Fatalf("hits = %+v", hits)
+		}
+		b, err := json.Marshal(hits[0])
+		if err != nil || strings.Contains(string(b), "context") {
+			t.Fatalf("context key must be omitted: %s", b)
+		}
+	})
+}
+
+func TestClampCtx(t *testing.T) {
+	for in, want := range map[int]int{-3: 0, -1: 0, 0: 0, 1: 1, 5: 5, 6: 5, 99: 5} {
+		if got := clampCtx(in); got != want {
+			t.Fatalf("clampCtx(%d) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------- fast_tree
+
+func treeNames(t *testing.T, s string) []string {
+	t.Helper()
+	m := mustJSON(t, s)
+	var entries []treeEntry
+	b, _ := json.Marshal(m["entries"])
+	if err := json.Unmarshal(b, &entries); err != nil {
+		t.Fatalf("entries not parseable: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, filepath.Base(e.Path))
+	}
+	return names
+}
+
+func mkTree(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, d := range []string{"sub/deep", ".git", "node_modules", "pkg_cache"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{
+		"root.txt", filepath.Join("sub", "mid.txt"),
+		filepath.Join("sub", "deep", "leaf.txt"),
+		filepath.Join(".git", "hidden.txt"),
+		filepath.Join("node_modules", "dep.js"),
+		filepath.Join("pkg_cache", "c.bin"),
+	} {
+		if err := os.WriteFile(filepath.Join(root, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+func TestFastTree(t *testing.T) {
+	root := mkTree(t)
+
+	t.Run("dirs-first order, alphabetical, skips", func(t *testing.T) {
+		m := mustJSON(t, fastTree(root, 10, 5000, ""))
+		if m["success"] != true || m["truncated"] != false {
+			t.Fatalf("envelope = %v", m)
+		}
+		got := treeNames(t, jmap(m))
+		// depth 1: dirs sub (skips: .git, node_modules, pkg_cache via the
+		// *_cache rule), file root.txt; depth 2: deep, mid.txt;
+		// depth 3: leaf.txt
+		want := []string{"sub", "root.txt", "deep", "mid.txt", "leaf.txt"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+		for i, e := range m["entries"].([]any) {
+			ent := e.(map[string]any)
+			if _, ok := ent["mtime"].(float64); !ok {
+				t.Fatalf("entry %d missing mtime: %v", i, ent)
+			}
+		}
+	})
+
+	t.Run("depth budget", func(t *testing.T) {
+		got := treeNames(t, fastTree(root, 1, 5000, ""))
+		want := []string{"sub", "root.txt"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("depth 1 = %v, want %v", got, want)
+		}
+		got = treeNames(t, fastTree(root, 2, 5000, ""))
+		want = []string{"sub", "root.txt", "deep", "mid.txt"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("depth 2 = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("depth and entry clamps", func(t *testing.T) {
+		got := treeNames(t, fastTree(root, 0, 0, "")) // clamps to 1/1
+		if len(got) != 1 {
+			t.Fatalf("clamped tree = %v", got)
+		}
+		m := mustJSON(t, fastTree(root, 99, 99, ""))
+		if m["truncated"] != false {
+			t.Fatalf("99/99 must not truncate on this tree: %v", m)
+		}
+	})
+
+	t.Run("entry budget truncates with hint", func(t *testing.T) {
+		m := mustJSON(t, fastTree(root, 10, 3, ""))
+		if m["total"] != float64(3) || m["truncated"] != true {
+			t.Fatalf("envelope = %v", m)
+		}
+		if hint, _ := m["hint"].(string); !strings.Contains(hint, "max_entries=3") {
+			t.Fatalf("hint = %q", hint)
+		}
+	})
+
+	t.Run("pattern filters names but still descends", func(t *testing.T) {
+		got := treeNames(t, fastTree(root, 10, 5000, "*.txt"))
+		want := []string{"root.txt", "mid.txt", "leaf.txt"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("pattern tree = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("missing dir errors", func(t *testing.T) {
+		m := mustJSON(t, fastTree(filepath.Join(root, "nope"), 3, 500, ""))
+		if m["success"] != false {
+			t.Fatalf("envelope = %v", m)
+		}
+	})
+}
+
+// ------------------------------------------------------------ batch_search
+
+func TestBatchSearchValidation(t *testing.T) {
+	mk := func(ops ...map[string]any) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"ops": ops})
+		return b
+	}
+	one := map[string]any{"pattern": "x", "path": t.TempDir()}
+
+	if _, isErr, unknown := dispatchTool("batch_search", mk(one)); unknown || isErr {
+		t.Fatalf("single valid op: isErr=%v unknown=%v", isErr, unknown)
+	}
+	_, isErr, _ := dispatchTool("batch_search", mk(one, map[string]any{"pattern": "", "path": "/tmp"}))
+	if !isErr {
+		t.Fatalf("empty pattern op must reject the batch")
+	}
+	_, isErr, _ = dispatchTool("batch_search", mk(one, map[string]any{"pattern": "x", "path": ""}))
+	if !isErr {
+		t.Fatalf("empty path op must reject the batch")
+	}
+	many := make([]map[string]any, 17)
+	for i := range many {
+		many[i] = one
+	}
+	text, isErr, _ := dispatchTool("batch_search", mk(many...))
+	if !isErr || !strings.Contains(text, "split") {
+		t.Fatalf("17 ops must be rejected: %v", text)
+	}
+	text, isErr, _ = dispatchTool("batch_search", mk(one))
+	if isErr || !strings.Contains(text, `"success":true`) {
+		t.Fatalf("valid batch envelope = %v", text)
+	}
+}

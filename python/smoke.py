@@ -77,8 +77,8 @@ def main():
 
     tools = [t["name"] for t in c.call("tools/list")["result"]["tools"]]
     check("tools/list", sorted(tools) == sorted(
-        ["fast_read", "batch_read", "fast_search", "warm_exec", "batch_exec",
-         "doctor"]), str(tools))
+        ["fast_read", "batch_read", "fast_search", "batch_search", "fast_tree",
+         "warm_exec", "batch_exec", "doctor"]), str(tools))
 
     with tempfile.TemporaryDirectory() as td:
         f1 = os.path.join(td, "a.txt")
@@ -152,6 +152,86 @@ def main():
               not err and rcol["success"] and rcol["total_hits"] == 1 and
               rcol["hits"][0]["path"].endswith(os.path.join("co:lon", "f.txt")) and
               rcol["hits"][0]["line"] == 1, str(rcol.get("hits")))
+
+        # context param: N lines of gutter around each hit. Both engines
+        # (rg -C and the walk fallback) must emit the same gutter format:
+        # "L-line" before the match, "L+line" after. Default 0 must keep
+        # the envelope byte-identical (no "context" key at all).
+        cfile = os.path.join(td, "ctx.txt")
+        with open(cfile, "w") as f:
+            f.write("before_line\nneedle_ctx target\nafter_line\n")
+        rctx, err = c.tool("fast_search", {"pattern": "needle_ctx",
+                                           "path": cfile, "context": 1})
+        h = (rctx.get("hits") or [{}])[0]
+        check("fast_search context=1 gutter", not err and rctx["success"] and
+              h.get("line") == 2 and h.get("content") == "needle_ctx target" and
+              h.get("context") == "1-before_line\n3+after_line", str(h))
+        rctx2, _ = c.tool("fast_search", {"pattern": "needle_ctx",
+                                          "path": cfile, "context": 99})
+        check("fast_search context clamps to 5",
+              "context" in rctx2["hits"][0])
+        rctx0, _ = c.tool("fast_search", {"pattern": "needle_ctx", "path": cfile})
+        check("fast_search context absent by default",
+              "context" not in rctx0["hits"][0])
+
+        # batch_search: the parallel member of the batching triad. Order
+        # preserved, whole batch validated up front, per-op failures isolated.
+        bs, err = c.tool("batch_search", {"ops": [
+            {"pattern": "needle_alpha", "path": td, "limit": 2},
+            {"pattern": "needle_beta", "path": td}]})
+        bsr = bs["results"]
+        check("batch_search order+results", not err and bs["success"] and
+              len(bsr) == 2 and bsr[0]["total_hits"] == 50 and
+              bsr[0]["shown"] == 2 and bsr[1]["hits"][0]["line"] == 2,
+              str(bsr)[:200])
+        bs2, _ = c.tool("batch_search", {"ops": [
+            {"pattern": "needle_alpha", "path": td},
+            {"pattern": "[", "path": td}]})  # invalid regex: op-level failure
+        check("batch_search per-op error isolated",
+              bs2["results"][0]["success"] and
+              not bs2["results"][1]["success"])
+        bs3, _ = c.tool("batch_search", {"ops": [{"pattern": "p", "path": td}] * 17})
+        check("batch_search rejects >16",
+              not bs3["success"] and "split" in bs3["error"])
+        bs4, _ = c.tool("batch_search", {"ops": [
+            {"pattern": "x", "path": td}, {"pattern": "", "path": td}]})
+        check("batch_search whole-batch validation",
+              not bs4["success"] and bs4["error"].startswith("op 1 invalid"),
+              str(bs4))
+        bs5, _ = c.tool("batch_search", {"ops": [
+            {"pattern": "needle_ctx", "path": td, "context": 1}]})
+        check("batch_search op context param",
+              bs5["results"][0]["hits"][0].get("context") ==
+              "1-before_line\n3+after_line")
+
+        # fast_tree: budgeted listing. Deterministic dirs-first order,
+        # depth budget, shared skip list, truncation flag.
+        ttree = os.path.join(td, "tree")
+        os.makedirs(os.path.join(ttree, "sub", "deep"))
+        os.makedirs(os.path.join(ttree, ".git"))
+        os.makedirs(os.path.join(ttree, "node_modules"))
+        for p in ("root.txt", os.path.join("sub", "mid.txt"),
+                  os.path.join("sub", "deep", "leaf.txt"),
+                  os.path.join(".git", "hidden.txt")):
+            with open(os.path.join(ttree, p), "w") as f:
+                f.write("x")
+        rt, err = c.tool("fast_tree", {"path": ttree, "max_depth": 2})
+        names = [os.path.basename(e["path"]) for e in rt.get("entries", [])]
+        check("fast_tree depth budget + skips + order",
+              not err and rt["success"] and not rt["truncated"] and
+              names == ["sub", "root.txt", "deep", "mid.txt"] and
+              rt["entries"][0]["is_dir"] is True and
+              isinstance(rt["entries"][0]["mtime"], int),
+              str(names))
+        rt2, _ = c.tool("fast_tree", {"path": ttree, "max_entries": 2})
+        check("fast_tree truncated on tiny max_entries",
+              rt2["truncated"] and rt2["total"] == 2)
+        rt3, _ = c.tool("fast_tree", {"path": ttree, "pattern": "*.txt"})
+        names3 = sorted(os.path.basename(e["path"]) for e in rt3["entries"])
+        check("fast_tree pattern filter",
+              names3 == ["leaf.txt", "mid.txt", "root.txt"], str(names3))
+        rt4, _ = c.tool("fast_tree", {"path": ttree + ".missing"})
+        check("fast_tree missing dir", not rt4["success"])
 
         # warm_exec: the money lane — state must survive across calls
         rw, err = c.tool("warm_exec", {"command": "export TR_PROOF=alive$$ && cd /tmp"})
@@ -260,13 +340,19 @@ def main():
 
     # Negative control: kill-switches refuse acceleration, fail closed
     nc = Client(env_extra={"TOOLRUSH_PERSIST": "0", "TOOLRUSH_FASTLANE": "0",
-                           "TOOLRUSH_SEARCH": "0"})
+                           "TOOLRUSH_SEARCH": "0", "TOOLRUSH_PARALLEL": "0"})
     nc.call("initialize")
     r, _ = nc.tool("fast_read", {"path": "/etc/hostname"})
     check("NEG TOOLRUSH_FASTLANE=0 refuses", not r["success"] and "FASTLANE" in r["error"])
     r, _ = nc.tool("warm_exec", {"command": "echo spawn-mode"})
     check("NEG TOOLRUSH_PERSIST=0 spawn fallback",
           r["success"] and r["mode"] == "spawn" and "spawn-mode" in r["stdout"])
+    r, _ = nc.tool("batch_search", {"ops": [{"pattern": "x", "path": "/tmp"}]})
+    check("NEG TOOLRUSH_PARALLEL=0 refuses batch_search",
+          not r["success"] and "PARALLEL" in r["error"])
+    r, _ = nc.tool("fast_tree", {"path": "/tmp"})
+    check("NEG TOOLRUSH_FASTLANE=0 refuses fast_tree",
+          not r["success"] and "FASTLANE" in r["error"])
     with tempfile.TemporaryDirectory() as td:
         with open(os.path.join(td, "x.txt"), "w") as f:
             f.write("needle_gamma\n")

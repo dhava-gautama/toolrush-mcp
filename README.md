@@ -20,8 +20,10 @@ monkeypatching.
 | Tool | What it does |
 |---|---|
 | `fast_read` | In-process file read: line-number gutter, offset/limit paging, negative offset = tail, binary sniff, BOM strip, >64MB files stream the window. Line-level mtime cache — page turns are cache hits |
-| `batch_read` | 1–16 reads through **one** tool call, input order, whole-batch validated before anything runs |
-| `fast_search` | Direct `rg` transport — real `.gitignore`, real regex grammar. Pure-Go walk fallback when rg is absent |
+| `batch_read` | 1–16 reads through **one** tool call, input order, whole-batch validated before anything runs (serial by design — measured faster than pooling on page-cache-fast storage) |
+| `fast_search` | Direct `rg` transport — real `.gitignore`, real regex grammar. Pure-Go walk fallback when rg is absent. `context=N` (0–5) adds N lines of gutter around each hit: `L-line` before, `L+line` after |
+| `batch_search` | 1–16 searches through **one** call, fanned out across goroutines — each op spawns its own rg process, so the batch wall time approaches the slowest op, not the sum. Input order, whole-batch validated, per-op failures isolated |
+| `fast_tree` | Budgeted directory listing: deterministic dirs-first alphabetical order, depth (1–10) and entry (1–5000) budgets, basename pattern filter. Skips `.git`, `node_modules`, `__pycache__`, `.venv`, `target`, `dist`, `build`, `*_cache`. No `.gitignore` parsing — use `pattern=` to narrow |
 | `warm_exec` | **One persistent bash**: `cd`, `export`, and shell state survive across calls (harness terminals spawn fresh shells per call). Per-call framing, rc + cwd read back from the shell, process-group kill on timeout, never retries a submitted command |
 | `batch_exec` | 1–16 shell commands through **one** call on the warm shell, sequentially, state flowing between them |
 | `doctor` | Lane status, versions, kill-switch state, counters |
@@ -41,8 +43,19 @@ From `bench/bench_go.py` (Linux, i7-8750H, medians; your numbers will vary):
 | ping round trip | 0.034 ms | 0.035 ms | 0.019 ms |
 | cold `batch_read`, 16×1000-line files | 31.3 ms | 22.9 ms | — |
 | `fast_read` **during** a 2s `warm_exec` | 2002.4 ms | **0.37 ms** | — |
+| 6 searches: `batch_search` (1 call) vs 6× `fast_search` | 2899.9 ms | **2574.6 ms** vs 2714.3 ms | — |
 
-The last row is the architectural one: per-request goroutines mean a long
+The last row is 6 full-tree `rg` scans over `/usr/share/doc` (424 MB, median
+of 10, this i7-8750H + HDD box). The Go server fans the ops out across
+goroutines but wins only ~1.05x here: the scans are disk-bound, and six
+concurrent rg processes saturate the same spindle (raw concurrent rg outside
+the server measures the same 1.05x). On page-cache-hot trees or
+CPU-bound regexes the parallelism shows up for real; on cold HDD scans,
+honestly, it mostly saves the five extra RPC round trips. The Python
+reference runs its ops sequentially (GIL + subprocess dispatch overhead)
+and, as expected, ties its own 6-call loop.
+
+The `fast_read`-during-`warm_exec` row is the architectural one: per-request goroutines mean a long
 shell command never head-of-line blocks the other tools. Per-call latency is
 kernel/transport-bound and deliberately ties — there is nothing left to win
 there in any language.
@@ -123,8 +136,8 @@ carries protocol frames only (diagnostics on stderr).
 ## Verify / develop
 
 ```
-python3 python/smoke.py                                   # 27 checks vs Python impl
-TOOLRUSH_SERVER=./toolrush-go python3 python/smoke.py     # same 27 vs Go binary
+python3 python/smoke.py                                   # 53 checks vs Python impl
+TOOLRUSH_SERVER=./toolrush-go python3 python/smoke.py     # same 53 vs Go binary
 python3 bench/bench_go.py                                 # Python vs Go vs C shootout
 gcc -O2 -o bench/ping_ref bench/ping_ref.c                # C floor reference
 python3 bench/bench_lang.py                               # transport floor
