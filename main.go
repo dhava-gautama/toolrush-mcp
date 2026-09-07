@@ -634,20 +634,33 @@ func collectHitsJSON(out, engine string, limit, offset, ctx int, capped bool) st
 			if len(pending) > 0 {
 				rows := make([]string, 0, len(pending))
 				for _, p := range pending {
-					rows = append(rows, strconv.Itoa(p.no)+"-"+clampLine(p.line))
+					// only rows within the C-window before this match are
+					// its before-context; older rows are orphans of a
+					// skipped/offscreen match — drop them
+					if p.no < h.Line && p.no >= h.Line-ctx {
+						rows = append(rows, strconv.Itoa(p.no)+"-"+clampLine(p.line))
+					}
 				}
-				h.Context = strings.Join(rows, "\n")
+				if len(rows) > 0 {
+					h.Context = strings.Join(rows, "\n")
+				}
 				pending = nil
 			}
 			hits = append(hits, h)
 			last = &hits[len(hits)-1]
 		case "context":
 			line := stripOneCRLF(msg.Data.Lines.Text)
-			if last != nil {
+			no := msg.Data.LineNumber
+			// rg --json emits no group separator between disjoint groups:
+			// a row is after-context of the preceding shown match only when
+			// it falls within that match's C-window; otherwise it is
+			// before-context of the following match (buffered). Same-file
+			// is guaranteed: "begin" resets last/pending per file.
+			if last != nil && no > last.Line && no <= last.Line+ctx {
 				last.Context = joinCtx(last.Context,
-					strconv.Itoa(msg.Data.LineNumber)+"+"+clampLine(line))
+					strconv.Itoa(no)+"+"+clampLine(line))
 			} else {
-				pending = append(pending, ctxLine{msg.Data.LineNumber, line})
+				pending = append(pending, ctxLine{no, line})
 			}
 		}
 	}

@@ -469,8 +469,13 @@ def _search_rg(pattern, path, file_glob, case_sensitive, limit, offset,
             h = {"path": p, "line": no,
                  "content": _clamp_line(_json_line_text(data))}
             if before:
-                h["context"] = "\n".join(f"{b}-{_clamp_line(t)}"
-                                         for b, t in before)
+                # only rows within the C-window before this match are its
+                # before-context; older rows are orphans of a skipped or
+                # offscreen match — drop them
+                rows = [f"{b}-{_clamp_line(t)}" for b, t in before
+                        if no - context <= b < no]
+                if rows:
+                    h["context"] = "\n".join(rows)
                 before = []
             hits.append(h)
             prev = (p, no)

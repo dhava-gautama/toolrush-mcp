@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-09-07
+
+### Fixed
+
+- Search context attribution across disjoint match groups: `rg --json`
+  emits no group separators, so a context row outside a hit's C-window was
+  wrongly attached as after-context of the previous hit (found via live use:
+  a hit at line 8 carried "93+"). Rows now attach by the C-window rule in
+  both implementations, and orphan rows from offset-skipped matches are
+  dropped instead of leaking onto the next shown hit
+- Smoke suite gains two regression checks for disjoint-group attribution
+  (71 checks total)
+
 ## [1.1.2] - 2026-09-07
 
 ### Fixed
@@ -91,6 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `warm_exec`, `batch_exec`, `doctor`), Go implementation (stdlib only) and
   Python reference implementation, cross-language benchmarks.
 
+[1.1.3]: https://github.com/dhava-gautama/toolrush-mcp/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/dhava-gautama/toolrush-mcp/compare/v1.1.0...v1.1.2
 [1.1.0]: https://github.com/dhava-gautama/toolrush-mcp/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/dhava-gautama/toolrush-mcp/compare/v1.0.0...v1.0.1

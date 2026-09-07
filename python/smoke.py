@@ -232,6 +232,38 @@ def main():
               hhy.get("line") == 3 and
               hhy.get("context") == "2-2-two\n4+4-four", str(hhy))
 
+        # disjoint match groups: context rows far outside a hit's C-window
+        # are the NEXT match's before-context, never after-context of the
+        # previous one (found via live CHANGELOG search: "93+" glued to a
+        # hit at line 8). rg --json emits no group separators, so this
+        # exercises the C-window rule directly.
+        farf = os.path.join(td, "far.txt")
+        with open(farf, "w") as f:
+            f.write("".join(f"filler {i}\n" for i in (1, 2)) +
+                    "NEEDLE_FAR three\n" +
+                    "".join(f"filler {i}\n" for i in (4, 5, 6, 7, 8)) +
+                    "NEEDLE_FAR nine\nfiller 10\nfiller 11\n")
+        rfar, err = c.tool("fast_search", {"pattern": "NEEDLE_FAR",
+                                           "path": farf, "context": 1})
+        hfar = rfar.get("hits") or [{}, {}]
+        check("fast_search context: disjoint groups don't cross-attach",
+              not err and rfar["success"] and rfar["total_hits"] == 2 and
+              hfar[0].get("line") == 3 and
+              hfar[0].get("context") == "2-filler 2\n4+filler 4" and
+              hfar[1].get("line") == 9 and
+              hfar[1].get("context") == "8-filler 8\n10+filler 10",
+              str(hfar)[:300])
+        # offset-skipped match must not orphan its context rows onto the
+        # next shown hit
+        rfar2, err = c.tool("fast_search", {"pattern": "NEEDLE_FAR",
+                                            "path": farf, "context": 1,
+                                            "offset": 1})
+        hfar2 = (rfar2.get("hits") or [{}])[0]
+        check("fast_search context: skipped match orphans dropped",
+              not err and hfar2.get("line") == 9 and
+              hfar2.get("context") == "8-filler 8\n10+filler 10",
+              str(hfar2)[:300])
+
         # envelope always carries the capped flag (regression: missing field)
         rcp, err = c.tool("fast_search", {"pattern": "NEEDLE-here", "path": hyf})
         check("fast_search capped flag present (false) on small search",
