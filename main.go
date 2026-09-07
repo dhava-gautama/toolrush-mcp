@@ -1712,6 +1712,7 @@ func main() {
 	fmt.Fprintf(os.Stderr, "[toolrush] toolrush-mcp %s ready (pid %d)\n",
 		version, os.Getpid())
 	r := bufio.NewReader(os.Stdin)
+	var wg sync.WaitGroup // in-flight handlers; drained before exit
 	for {
 		line, err := r.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
@@ -1721,13 +1722,22 @@ func main() {
 				reply(nil, nil, rpcError(-32700, "parse error"))
 			} else if len(req.ID) == 0 || string(req.ID) == "null" {
 				// notification — no reply
+			} else if req.Method == "initialize" {
+				handle(req) // synchronous: its reply must precede all others
 			} else {
 				// per-request goroutine: a long warm_exec never
 				// head-of-line blocks fast_read behind it
-				go handle(req)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					handle(req)
+				}()
 			}
 		}
 		if err != nil {
+			// stdin closed (pipe-driven use, harness shutdown): wait for
+			// in-flight handlers so their replies are not lost on exit
+			wg.Wait()
 			return
 		}
 	}
