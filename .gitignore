@@ -3,3 +3,4 @@ bench/ping_ref
 __pycache__/
 *.pyc
 tr_bench_scratch/
+/toolrush-mcp
