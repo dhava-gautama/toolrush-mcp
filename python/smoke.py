@@ -202,7 +202,8 @@ def main():
         hts = (rts.get("hits") or [{}])[0]
         check("fast_search rg --json: context rows are not phantom hits",
               not err and rts["success"] and rts["total_hits"] == 1 and
-              hts.get("path") == tfix and hts.get("line") == 2 and
+              os.path.realpath(hts.get("path", "")) == os.path.realpath(tfix) and
+              hts.get("line") == 2 and
               hts.get("context") == "1-12:00:01 INFO boot\n3+12:00:02 INFO done",
               str(rts)[:200])
 
