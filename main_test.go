@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -167,6 +169,19 @@ func TestRender(t *testing.T) {
 
 // -------------------------------------------------------------- collectHits
 
+// JSON message builders for the rg --json stream under test.
+func jmatch(path string, no int, text string) string {
+	return fmt.Sprintf(`{"type":"match","data":{"path":{"text":%q},`+
+		`"lines":{"text":%q},"line_number":%d}}`, path, text, no)
+}
+func jctx(no int, text string) string {
+	return fmt.Sprintf(`{"type":"context","data":{"lines":{"text":%q},`+
+		`"line_number":%d}}`, text, no)
+}
+func jbegin(path string) string {
+	return fmt.Sprintf(`{"type":"begin","data":{"path":{"text":%q}}}`, path)
+}
+
 func TestCollectHits(t *testing.T) {
 	type hit struct {
 		Path    string `json:"path"`
@@ -185,15 +200,15 @@ func TestCollectHits(t *testing.T) {
 	}
 
 	t.Run("plain hit", func(t *testing.T) {
-		_, hits := parse(t, collectHits("a/b.txt:3:hello world\n", "rg", 10, 0))
+		_, hits := parse(t, collectHitsJSON(jmatch("a/b.txt", 3, "hello world\n"), "rg", 10, 0, 0, false))
 		if len(hits) != 1 || hits[0].Path != "a/b.txt" ||
 			hits[0].Line != 3 || hits[0].Content != "hello world" {
 			t.Fatalf("hits = %+v", hits)
 		}
 	})
 
-	t.Run("colon in path (non-greedy fix)", func(t *testing.T) {
-		_, hits := parse(t, collectHits("co:lon/f.txt:1:needle\n", "rg", 10, 0))
+	t.Run("colon in path", func(t *testing.T) {
+		_, hits := parse(t, collectHitsJSON(jmatch("co:lon/f.txt", 1, "needle\n"), "rg", 10, 0, 0, false))
 		if len(hits) != 1 {
 			t.Fatalf("hits = %+v", hits)
 		}
@@ -203,21 +218,22 @@ func TestCollectHits(t *testing.T) {
 		}
 	})
 
-	t.Run("garbage lines skipped from hits", func(t *testing.T) {
-		m, hits := parse(t, collectHits("not a hit\nx/y.txt:2:real\n", "rg", 10, 0))
+	t.Run("unparseable rows do not count", func(t *testing.T) {
+		// with --json, garbage rows are not hits at all (the old text
+		// parser counted every non-empty row toward total_hits)
+		m, hits := parse(t, collectHitsJSON("garbage\n"+jmatch("x/y.txt", 2, "real\n"), "rg", 10, 0, 0, false))
 		if len(hits) != 1 || hits[0].Path != "x/y.txt" {
 			t.Fatalf("hits = %+v", hits)
 		}
-		// known quirk: garbage rows still count toward total_hits and
-		// therefore flip the truncated flag.
-		if m["total_hits"] != float64(2) {
+		if m["total_hits"] != float64(1) {
 			t.Fatalf("total_hits = %v", m["total_hits"])
 		}
 	})
 
 	t.Run("offset and limit windowing", func(t *testing.T) {
-		out := "f:1:a\nf:2:b\nf:3:c\nf:4:d\n"
-		m, hits := parse(t, collectHits(out, "rg", 2, 1))
+		out := jmatch("f", 1, "a\n") + "\n" + jmatch("f", 2, "b\n") + "\n" +
+			jmatch("f", 3, "c\n") + "\n" + jmatch("f", 4, "d\n")
+		m, hits := parse(t, collectHitsJSON(out, "rg", 2, 1, 0, false))
 		if len(hits) != 2 || hits[0].Line != 2 || hits[1].Line != 3 {
 			t.Fatalf("hits = %+v", hits)
 		}
@@ -230,14 +246,14 @@ func TestCollectHits(t *testing.T) {
 	})
 
 	t.Run("truncated flag when hits exceed limit", func(t *testing.T) {
-		m, hits := parse(t, collectHits("f:1:a\nf:2:b\n", "rg", 1, 0))
+		m, hits := parse(t, collectHitsJSON(jmatch("f", 1, "a\n")+"\n"+jmatch("f", 2, "b\n"), "rg", 1, 0, 0, false))
 		if len(hits) != 1 || m["truncated"] != true {
 			t.Fatalf("hits = %+v truncated = %v", hits, m["truncated"])
 		}
 	})
 
 	t.Run("empty output", func(t *testing.T) {
-		m, hits := parse(t, collectHits("", "rg", 10, 0))
+		m, hits := parse(t, collectHitsJSON("", "rg", 10, 0, 0, false))
 		if len(hits) != 0 || m["total_hits"] != float64(0) {
 			t.Fatalf("m = %v", m)
 		}
@@ -245,9 +261,27 @@ func TestCollectHits(t *testing.T) {
 
 	t.Run("overlong content clamped", func(t *testing.T) {
 		long := strings.Repeat("z", 2500)
-		_, hits := parse(t, collectHits("f:1:"+long+"\n", "rg", 10, 0))
+		_, hits := parse(t, collectHitsJSON(jmatch("f", 1, long+"\n"), "rg", 10, 0, 0, false))
 		if !strings.HasSuffix(hits[0].Content, "... [truncated]") {
 			t.Fatalf("content not clamped (len %d)", len(hits[0].Content))
+		}
+	})
+
+	t.Run("CRLF terminator stripped once", func(t *testing.T) {
+		_, hits := parse(t, collectHitsJSON(jmatch("f", 1, "hello\r\n"), "rg", 10, 0, 0, false))
+		if hits[0].Content != "hello" {
+			t.Fatalf("content = %q", hits[0].Content)
+		}
+	})
+
+	t.Run("capped flag always present", func(t *testing.T) {
+		m, _ := parse(t, collectHitsJSON(jmatch("f", 1, "a\n"), "rg", 10, 0, 0, false))
+		if c, ok := m["capped"]; !ok || c != false {
+			t.Fatalf("capped = %v (missing or not false)", m["capped"])
+		}
+		m2, _ := parse(t, collectHitsJSON(jmatch("f", 1, "a\n"), "rg", 10, 0, 0, true))
+		if m2["capped"] != true {
+			t.Fatalf("capped = %v, want true", m2["capped"])
 		}
 	})
 }
@@ -499,18 +533,19 @@ func FuzzSplitLines(f *testing.F) {
 }
 
 func FuzzCollectHits(f *testing.F) {
-	f.Add("a/b.txt:3:hello\n")
-	f.Add("co:lon/f.txt:1:needle\n")
-	f.Add("garbage line\nf:2:x\n\n")
+	f.Add(jmatch("a/b.txt", 3, "hello\n"))
+	f.Add(jmatch("co:lon/f.txt", 1, "needle\n"))
+	f.Add("garbage line\n" + jmatch("f", 2, "x\n") + "\n")
 	f.Add("")
 	f.Add(":::\n1:2:3:4:5\n")
+	f.Add(jbegin("f") + "\n" + jctx(1, "c\n") + jmatch("f", 2, "m\n"))
 	f.Fuzz(func(t *testing.T, data string) {
 		limit := 1 + len(data)%37
 		offset := len(data) % 11
-		out := collectHits(data, "fuzz", limit, offset)
+		out := collectHitsJSON(data, "fuzz", limit, offset, 1, false)
 		var m map[string]any
 		if err := json.Unmarshal([]byte(out), &m); err != nil {
-			t.Fatalf("collectHits emitted invalid JSON: %v\n%q", err, out)
+			t.Fatalf("collectHitsJSON emitted invalid JSON: %v\n%q", err, out)
 		}
 	})
 }
@@ -519,7 +554,7 @@ func FuzzCollectHits(f *testing.F) {
 
 func parseCtxHits(t *testing.T, s string, limit, offset int) []searchHit {
 	t.Helper()
-	m := mustJSON(t, collectHitsRg(s, "rg", limit, offset, 1))
+	m := mustJSON(t, collectHitsJSON(s, "rg", limit, offset, 1, false))
 	var hits []searchHit
 	b, _ := json.Marshal(m["hits"])
 	if err := json.Unmarshal(b, &hits); err != nil {
@@ -528,9 +563,10 @@ func parseCtxHits(t *testing.T, s string, limit, offset int) []searchHit {
 	return hits
 }
 
-func TestCollectHitsRgContext(t *testing.T) {
+func TestCollectHitsJSONContext(t *testing.T) {
 	t.Run("before and after gutter", func(t *testing.T) {
-		out := "f.txt-9-before\nf.txt:10:match\nf.txt-11-after\n"
+		out := jbegin("f.txt") + "\n" + jctx(9, "before\n") + "\n" +
+			jmatch("f.txt", 10, "match\n") + "\n" + jctx(11, "after\n")
 		hits := parseCtxHits(t, out, 10, 0)
 		if len(hits) != 1 || hits[0].Line != 10 || hits[0].Content != "match" {
 			t.Fatalf("hits = %+v", hits)
@@ -540,8 +576,12 @@ func TestCollectHitsRgContext(t *testing.T) {
 		}
 	})
 
-	t.Run("double dash separator opens a new group", func(t *testing.T) {
-		out := "f.txt:1:a\nf.txt-2-gap\n--\nf.txt-8-near\nf.txt:9:b\n"
+	t.Run("new file (begin) opens a new group", func(t *testing.T) {
+		// rows following a begin belong to the FOLLOWING match even when a
+		// match from the previous file is still the "last" hit
+		out := jbegin("f") + "\n" + jmatch("f", 1, "a\n") + "\n" +
+			jctx(2, "gap\n") + "\n" + jbegin("g") + "\n" +
+			jctx(8, "near\n") + "\n" + jmatch("g", 9, "b\n")
 		hits := parseCtxHits(t, out, 10, 0)
 		if len(hits) != 2 {
 			t.Fatalf("hits = %+v", hits)
@@ -549,22 +589,24 @@ func TestCollectHitsRgContext(t *testing.T) {
 		if hits[0].Context != "2+gap" {
 			t.Fatalf("hit0 context = %q", hits[0].Context)
 		}
-		// "8-near" follows the "--", so it belongs to the NEXT match
 		if hits[1].Context != "8-near" {
 			t.Fatalf("hit1 context = %q", hits[1].Context)
 		}
 	})
 
 	t.Run("context rows only counted for matches", func(t *testing.T) {
-		out := "f-1-x\nf:2:m1\nf-3-y\n--\nf-8-z\nf:9:m2\nf-10-w\n"
-		m := mustJSON(t, collectHitsRg(out, "rg", 10, 0, 2))
+		out := jctx(1, "x\n") + "\n" + jmatch("f", 2, "m1\n") + "\n" +
+			jctx(3, "y\n") + "\n" + jctx(8, "z\n") + "\n" +
+			jmatch("f", 9, "m2\n") + "\n" + jctx(10, "w\n")
+		m := mustJSON(t, collectHitsJSON(out, "rg", 10, 0, 2, false))
 		if m["total_hits"] != float64(2) || m["shown"] != float64(2) {
 			t.Fatalf("meta = %v", m)
 		}
 	})
 
 	t.Run("offset skips matches and their context", func(t *testing.T) {
-		out := "f:1:a\nf-2-x\n--\nf:9:b\nf-10-y\n"
+		out := jmatch("f", 1, "a\n") + "\n" + jctx(2, "x\n") + "\n" +
+			jbegin("f") + "\n" + jmatch("f", 9, "b\n") + "\n" + jctx(10, "y\n")
 		hits := parseCtxHits(t, out, 10, 1)
 		if len(hits) != 1 || hits[0].Line != 9 || hits[0].Context != "10+y" {
 			t.Fatalf("hits = %+v", hits)
@@ -572,9 +614,10 @@ func TestCollectHitsRgContext(t *testing.T) {
 	})
 
 	t.Run("multiple matches share one group gutter", func(t *testing.T) {
-		// rg merges overlapping groups: lines between two close matches are
-		// printed once, after the first match
-		out := "f:1:a\nf-2-shared\nf:3:b\nf-4-tail\n"
+		// rg prints a row between two close matches once, positioned after
+		// the first match -> it becomes after-context of the preceding hit
+		out := jmatch("f", 1, "a\n") + "\n" + jctx(2, "shared\n") + "\n" +
+			jmatch("f", 3, "b\n") + "\n" + jctx(4, "tail\n")
 		hits := parseCtxHits(t, out, 10, 0)
 		if len(hits) != 2 {
 			t.Fatalf("hits = %+v", hits)
@@ -587,19 +630,8 @@ func TestCollectHitsRgContext(t *testing.T) {
 		}
 	})
 
-	t.Run("hyphen-digit path names resolve via prefix strip", func(t *testing.T) {
-		out := "a-1-b.txt-4-ctx\na-1-b.txt:5:hit\n"
-		hits := parseCtxHits(t, out, 10, 0)
-		if len(hits) != 1 || hits[0].Path != "a-1-b.txt" {
-			t.Fatalf("hits = %+v", hits)
-		}
-		if hits[0].Context != "4-ctx" {
-			t.Fatalf("context = %q", hits[0].Context)
-		}
-	})
-
 	t.Run("no context field when a hit has none", func(t *testing.T) {
-		out := "f:1:a\n--\nf:9:b\n"
+		out := jmatch("f", 1, "a\n") + "\n" + jbegin("g") + "\n" + jmatch("g", 9, "b\n")
 		hits := parseCtxHits(t, out, 10, 0)
 		if len(hits) != 2 || hits[0].Context != "" || hits[1].Context != "" {
 			t.Fatalf("hits = %+v", hits)
@@ -607,6 +639,20 @@ func TestCollectHitsRgContext(t *testing.T) {
 		b, err := json.Marshal(hits[0])
 		if err != nil || strings.Contains(string(b), "context") {
 			t.Fatalf("context key must be omitted: %s", b)
+		}
+	})
+
+	t.Run("timestamps with colons in context rows parse exactly", func(t *testing.T) {
+		// the ambiguity class that motivated --json: "12:00:01 INFO boot"
+		// must stay one context row with an exact line number
+		out := jbegin("log") + "\n" + jctx(4, "12:00:01 INFO boot\n") + "\n" +
+			jmatch("log", 5, "needle\n") + "\n" + jctx(6, "12:00:02 INFO up\n")
+		hits := parseCtxHits(t, out, 10, 0)
+		if len(hits) != 1 {
+			t.Fatalf("hits = %+v", hits)
+		}
+		if hits[0].Context != "4-12:00:01 INFO boot\n6+12:00:02 INFO up" {
+			t.Fatalf("context = %q", hits[0].Context)
 		}
 	})
 }
@@ -763,5 +809,259 @@ func TestBatchSearchValidation(t *testing.T) {
 	text, isErr, _ = dispatchTool("batch_search", mk(one))
 	if isErr || !strings.Contains(text, `"success":true`) {
 		t.Fatalf("valid batch envelope = %v", text)
+	}
+}
+
+// ------------------------------------------------- batch_read op clamping
+
+func TestBatchReadOpClamp(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f.txt")
+	var sb strings.Builder
+	for i := 1; i <= 10; i++ {
+		sb.WriteString(fmt.Sprintf("row%d\n", i))
+	}
+	if err := os.WriteFile(p, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	zero, big := 0, 99999
+	one := 1
+
+	// offset=0 used to reach render() as 0 and panic via lines[-1]
+	r := mustJSON(t, batchRead([]readOp{{Path: p, Offset: &zero}}))
+	res := r["results"].([]any)[0].(map[string]any)
+	if res["success"] != true {
+		t.Fatalf("offset=0 envelope = %v", res)
+	}
+	if c, _ := res["content"].(string); !strings.HasPrefix(c, "1\trow1") {
+		t.Fatalf("offset=0 content = %q", c)
+	}
+
+	// limit clamps to [1, readDefaultLimit] like fastRead
+	r = mustJSON(t, batchRead([]readOp{{Path: p, Limit: &big}}))
+	res = r["results"].([]any)[0].(map[string]any)
+	if c, _ := res["content"].(string); strings.Count(c, "\n") != 9 {
+		t.Fatalf("limit=99999 must clamp to 1000 lines, got %d rows", strings.Count(c, "\n")+1)
+	}
+	r = mustJSON(t, batchRead([]readOp{{Path: p, Limit: &one}}))
+	res = r["results"].([]any)[0].(map[string]any)
+	if c, _ := res["content"].(string); c != "1\trow1" {
+		t.Fatalf("limit=1 content = %q", c)
+	}
+}
+
+// ------------------------------------------------------- limitedWriter cap
+
+func TestLimitedWriterCapped(t *testing.T) {
+	var buf bytes.Buffer
+	lw := &limitedWriter{w: &buf, max: 8}
+	if _, err := lw.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if lw.capped {
+		t.Fatalf("capped set on under-limit write")
+	}
+	if _, err := lw.Write([]byte("defghi")); err != nil {
+		t.Fatal(err)
+	}
+	if !lw.capped {
+		t.Fatalf("capped not set when bytes were dropped")
+	}
+	if buf.Len() != 8 {
+		t.Fatalf("buffer len = %d, want 8", buf.Len())
+	}
+}
+
+// -------------------------------------------- warm_exec argument hardening
+
+func TestWarmExecRejectsNewlineCwd(t *testing.T) {
+	for _, cwd := range []string{"bad\ncwd", "bad\rcwd"} {
+		m := mustJSON(t, warmExec("echo hi", cwd, 5, false))
+		if m["success"] != false ||
+			m["error"] != "cwd must not contain newline characters" {
+			t.Fatalf("cwd %q envelope = %v", cwd, m)
+		}
+	}
+	m := mustJSON(t, batchExec([]string{"echo hi"}, "bad\ncwd", 5))
+	if m["success"] != false ||
+		m["error"] != "cwd must not contain newline characters" {
+		t.Fatalf("batch_exec newline cwd envelope = %v", m)
+	}
+}
+
+// ------------------------------------------- warm_exec write-wedge (SIGSTOP)
+
+// TestWarmExecWriteWedge: stop the shell, then send a frame far larger than
+// the 64KB pipe buffer. The write must not deadlock the server: the call
+// returns rc 124 within the timeout, and the wedged writer goroutine exits
+// once the tree is killed (buffered result channel -> no leak).
+func TestWarmExecWriteWedge(t *testing.T) {
+	ws := &warmShell{}
+	defer func() {
+		ws.mu.Lock()
+		ws.killLocked()
+		ws.mu.Unlock()
+	}()
+	if out, rc, _ := ws.run("echo warm", "", 10*time.Second); rc != 0 {
+		t.Fatalf("warmup rc=%d out=%q", rc, out)
+	}
+	pid := ws.cmd.Process.Pid
+	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+		t.Fatalf("SIGSTOP: %v", err)
+	}
+	defer syscall.Kill(pid, syscall.SIGCONT) // best effort cleanup
+	before := runtime.NumGoroutine()
+	start := time.Now()
+	out, rc, _ := ws.run("cat <<'EOF'\n"+strings.Repeat("x", 256<<10)+
+		"\nEOF", "", 2*time.Second)
+	elapsed := time.Since(start)
+	if rc != 124 {
+		t.Fatalf("rc=%d, want 124 (write wedge must time out); out=%q", rc, out)
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("wedge took %v — server-wide deadlock", elapsed)
+	}
+	if !strings.Contains(out, "timed out") {
+		t.Fatalf("out missing timeout notice: %q", out)
+	}
+	// after the kill the shell respawns and serves again
+	out, rc, _ = ws.run("echo back", "", 10*time.Second)
+	if rc != 0 || strings.TrimSpace(out) != "back" {
+		t.Fatalf("post-wedge rc=%d out=%q", rc, out)
+	}
+	// wedged writer goroutines must drain, not accumulate
+	waitFor(t, "goroutines to settle", 5*time.Second, func() bool {
+		return runtime.NumGoroutine() <= before+2
+	})
+}
+
+// ------------------------------------------------------ reader 1MB line cap
+
+func TestWarmShellReaderLineCap(t *testing.T) {
+	ws := &warmShell{}
+	defer func() {
+		ws.mu.Lock()
+		ws.killLocked()
+		ws.mu.Unlock()
+	}()
+	// one single 3MB line, then a normal line proving the shell is sane
+	out, rc, _ := ws.run("printf 'huge'; head -c 3000000 /dev/zero | tr '\\0' 'y'; "+
+		"printf '\\nmarker\\n'", "", 15*time.Second)
+	if rc != 0 {
+		t.Fatalf("rc=%d out len=%d", rc, len(out))
+	}
+	if !strings.Contains(out, "marker") {
+		t.Fatalf("line after the capped line lost: len=%d", len(out))
+	}
+	// the capped line keeps AT MOST maxShellLine of the 3MB run: locate the
+	// run of 'y's and bound its length (the first 1MB legitimately is 'y')
+	ys := 0
+	for _, b := range []byte(out) {
+		if b == 'y' {
+			ys++
+		}
+	}
+	if ys > maxShellLine {
+		t.Fatalf("%d 'y' bytes materialized, cap is %d", ys, maxShellLine)
+	}
+	if len(out) > maxShellLine+len("huge")+len("marker")+64 {
+		t.Fatalf("out len %d far above the 1MB cap", len(out))
+	}
+}
+
+// ------------------------------------------------------ fast_tree hardening
+
+func TestFastTreeInvalidPattern(t *testing.T) {
+	root := mkTree(t)
+	m := mustJSON(t, fastTree(root, 3, 500, "["))
+	if m["success"] != false || m["error"] != "invalid pattern: [" {
+		t.Fatalf("envelope = %v", m)
+	}
+}
+
+func TestFastTreeSymlinkLstat(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "realdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("realdir", filepath.Join(root, "linkdir")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := os.Symlink("gone", filepath.Join(root, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	m := mustJSON(t, fastTree(root, 10, 500, ""))
+	if m["success"] != true {
+		t.Fatalf("envelope = %v", m)
+	}
+	var ents []map[string]any
+	b, _ := json.Marshal(m["entries"])
+	if err := json.Unmarshal(b, &ents); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]map[string]any{}
+	var names []string
+	for _, e := range ents {
+		byName[filepath.Base(e["path"].(string))] = e
+		names = append(names, filepath.Base(e["path"].(string)))
+	}
+	// every entry must always carry is_symlink
+	for _, e := range ents {
+		if _, ok := e["is_symlink"].(bool); !ok {
+			t.Fatalf("entry missing is_symlink: %v", e)
+		}
+	}
+	ld := byName["linkdir"]
+	if ld == nil || ld["is_symlink"] != true || ld["is_dir"] != false {
+		t.Fatalf("linkdir entry = %v", ld)
+	}
+	if dg := byName["dangling"]; dg == nil || dg["is_symlink"] != true {
+		t.Fatalf("dangling link not listed: %v", dg)
+	}
+	// symlinked dir must NOT be descended into: nothing from inside realdir
+	// appears under the link, and realdir's own children are not duplicated
+	if byName["f.txt"] == nil || byName["realdir"] == nil {
+		t.Fatalf("missing base entries: %v", names)
+	}
+}
+
+func TestFastTreeExactFitNotTruncated(t *testing.T) {
+	root := t.TempDir()
+	for _, n := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(root, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := mustJSON(t, fastTree(root, 1, 2, ""))
+	if m["total"] != float64(2) || m["truncated"] != false {
+		t.Fatalf("exact fit must not truncate: %v", m)
+	}
+	m = mustJSON(t, fastTree(root, 1, 1, ""))
+	if m["truncated"] != true {
+		t.Fatalf("omitted entry must truncate: %v", m)
+	}
+}
+
+// ------------------------------------------------------- searchWalk glob
+
+func TestSearchWalkInvalidGlob(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("needle\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := mustJSON(t, fastSearch("needle", dir, "[", true, 10, 0, 0))
+	if useSearch && rg() != "" {
+		// rg validates -g itself and errors — either way it must not be
+		// a silent empty listing
+		if m["success"] != false {
+			t.Fatalf("invalid glob envelope = %v", m)
+		}
+	} else {
+		if m["success"] != false || m["error"] != "invalid pattern: [" {
+			t.Fatalf("walk invalid glob envelope = %v", m)
+		}
 	}
 }

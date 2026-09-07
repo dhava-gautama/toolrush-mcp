@@ -21,9 +21,9 @@ monkeypatching.
 |---|---|
 | `fast_read` | In-process file read: line-number gutter, offset/limit paging, negative offset = tail, binary sniff, BOM strip, >64MB files stream the window. Line-level mtime cache — page turns are cache hits |
 | `batch_read` | 1–16 reads through **one** tool call, input order, whole-batch validated before anything runs (serial by design — measured faster than pooling on page-cache-fast storage) |
-| `fast_search` | Direct `rg` transport — real `.gitignore`, real regex grammar. Pure-Go walk fallback when rg is absent. `context=N` (0–5) adds N lines of gutter around each hit: `L-line` before, `L+line` after |
+| `fast_search` | Direct `rg` transport — real `.gitignore`, real regex grammar. Pure-Go walk fallback when rg is absent. `context=N` (0–5) adds N lines of gutter around each hit: `L-line` before, `L+line` after. Output stops at 8MB of rg output — `capped:true` means `total_hits` is a lower bound |
 | `batch_search` | 1–16 searches through **one** call, fanned out across goroutines — each op spawns its own rg process, so the batch wall time approaches the slowest op, not the sum. Input order, whole-batch validated, per-op failures isolated |
-| `fast_tree` | Budgeted directory listing: deterministic dirs-first alphabetical order, depth (1–10) and entry (1–5000) budgets, basename pattern filter. Skips `.git`, `node_modules`, `__pycache__`, `.venv`, `target`, `dist`, `build`, `*_cache`. No `.gitignore` parsing — use `pattern=` to narrow |
+| `fast_tree` | Budgeted directory listing: deterministic dirs-first alphabetical order, depth (1–10) and entry (1–5000) budgets, basename pattern filter (invalid patterns error rather than matching nothing). Skips `.git`, `node_modules`, `__pycache__`, `.venv`, `target`, `dist`, `build`, `*_cache`. Entries carry `is_symlink` (lstat semantics, dangling links included). No `.gitignore` parsing — use `pattern=` to narrow |
 | `warm_exec` | **One persistent bash**: `cd`, `export`, and shell state survive across calls (harness terminals spawn fresh shells per call). Per-call framing, rc + cwd read back from the shell, process-group kill on timeout, never retries a submitted command |
 | `batch_exec` | 1–16 shell commands through **one** call on the warm shell, sequentially, state flowing between them |
 | `doctor` | Lane status, versions, kill-switch state, counters |
@@ -154,6 +154,27 @@ python3 bench/bench_lang.py                               # transport floor
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md).
+
+## Known limitations
+
+Honest footguns, so you learn them here instead of in a lost hour:
+
+- `warm_exec`: a command with an unclosed quote hangs until the call
+  timeout, then the shell is destroyed and respawned (state lost). Quote
+  carefully.
+- `warm_exec`: background jobs that outlive their command (e.g.
+  `sleep 99 &`) keep writing into whichever call is in flight — output
+  attribution is best-effort. Processes that call `setsid` escape the
+  timeout kill (same as any terminal).
+- Concurrent `warm_exec` calls from a pipelining client have no
+  execution-order guarantee — use `batch_exec` for ordered sequences.
+- A background child holding the shell's output pipe delays death
+  detection until the timeout.
+- Output caps: `fast_search`/`batch_search` stop at 8MB of rg output (see
+  `capped`); `warm_exec` caps at 8MB (`truncated`).
+- `fast_tree` doesn't parse `.gitignore` (the skip list covers the common
+  cases).
+- POSIX only; Windows untested.
 
 ## Origin and license
 

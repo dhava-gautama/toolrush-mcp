@@ -99,6 +99,16 @@ def main():
         r4, _ = c.tool("fast_read", {"path": f1 + ".missing"})
         check("fast_read missing file", not r4["success"])
 
+        # wrong-type arg must fail as a clean validation error (pinned
+        # texts), never a protocol crash. isError is true here — both impls
+        # derive it from success==false — so assert the envelope text only.
+        rbad_t, err = c.tool("fast_read", {"path": 123})
+        emsg = rbad_t.get("error", "")
+        check("fast_read non-string path: pinned arg error, no crash",
+              not rbad_t["success"] and
+              (emsg.startswith("invalid arguments") or
+               emsg == "path must be a non-empty string"), str(rbad_t)[:200])
+
         # offset=0 must clamp to page 1 (regression: clamp happened after the
         # beyond-EOF check, so offset 0 errored/panicked)
         r0, _ = c.tool("fast_read", {"path": f1, "offset": 0, "limit": 5})
@@ -129,6 +139,13 @@ def main():
         check("batch_read rejects >16", not rb2["success"] and "split" in rb2["error"])
         rb3, _ = c.tool("batch_read", {"ops": [{"path": f1}, {"nope": 1}]})
         check("batch_read whole-batch validation", not rb3["success"])
+        # offset=0 must clamp to page 1 inside batch members too (regression:
+        # the clamp was missing here and the op surfaced an RPC-level error)
+        rb4, err = c.tool("batch_read", {"ops": [{"path": f1, "offset": 0,
+                                                  "limit": 2}]})
+        check("batch_read offset=0 clamps to page 1",
+              not err and rb4["success"] and rb4["results"][0]["success"] and
+              rb4["results"][0]["content"].startswith("1\t"), str(rb4)[:200])
         _, br_err = c.tool("batch_read", {"ops": [{"path": f1},
                                                   {"path": f1 + ".missing"}]})
         check("isError: batch_read partial failure stays false",
@@ -173,6 +190,64 @@ def main():
         rctx0, _ = c.tool("fast_search", {"pattern": "needle_ctx", "path": cfile})
         check("fast_search context absent by default",
               "context" not in rctx0["hits"][0])
+
+        # rg --json regression: context rows around a match carried
+        # timestamps, and re-deriving line numbers from row content turned
+        # them into phantom hits. Exactly ONE hit, real path, real line.
+        tfix = os.path.join(td, "ts.txt")
+        with open(tfix, "w") as f:
+            f.write("12:00:01 INFO boot\nNEEDLE_TS\n12:00:02 INFO done\n")
+        rts, err = c.tool("fast_search", {"pattern": "NEEDLE_TS",
+                                          "path": tfix, "context": 1})
+        hts = (rts.get("hits") or [{}])[0]
+        check("fast_search rg --json: context rows are not phantom hits",
+              not err and rts["success"] and rts["total_hits"] == 1 and
+              hts.get("path") == tfix and hts.get("line") == 2 and
+              hts.get("context") == "1-12:00:01 INFO boot\n3+12:00:02 INFO done",
+              str(rts)[:200])
+
+        # colon+digit dir name ("a:1:b") broke rg invocation parsing
+        adir = os.path.join(td, "a:1:b")
+        os.makedirs(adir)
+        with open(os.path.join(adir, "f.txt"), "w") as f:
+            f.write("first\nNEEDLE_CD\n")
+        rcd, err = c.tool("fast_search", {"pattern": "NEEDLE_CD", "path": td})
+        hcd = (rcd.get("hits") or [{}])[0]
+        check("fast_search colon+digit path",
+              not err and rcd["success"] and rcd["total_hits"] == 1 and
+              hcd.get("path", "").endswith(os.path.join("a:1:b", "f.txt")) and
+              hcd.get("line") == 2, str(rcd.get("hits")))
+
+        # gutter line numbers must come from rg's line_number field, never
+        # re-parsed out of the content ("2-two" would fake a line number)
+        hyf = os.path.join(td, "hy.txt")
+        with open(hyf, "w") as f:
+            f.write("one\n2-two\nNEEDLE-here\n4-four\n")
+        rhy, err = c.tool("fast_search", {"pattern": "NEEDLE-here",
+                                          "path": hyf, "context": 1})
+        hhy = (rhy.get("hits") or [{}])[0]
+        check("fast_search gutter: line numbers not re-derived from content",
+              not err and rhy["success"] and rhy["total_hits"] == 1 and
+              hhy.get("line") == 3 and
+              hhy.get("context") == "2-2-two\n4+4-four", str(hhy))
+
+        # envelope always carries the capped flag (regression: missing field)
+        rcp, err = c.tool("fast_search", {"pattern": "NEEDLE-here", "path": hyf})
+        check("fast_search capped flag present (false) on small search",
+              not err and rcp["success"] and rcp.get("capped") is False)
+
+        # capped=true: rg's --json output blows past the 8MB cap — success
+        # stays true, shown sticks to the requested limit
+        bigf = os.path.join(td, "many.txt")
+        with open(bigf, "w") as f:
+            f.writelines(f"NEEDLE row {i:06d} xxxxxxxxxxxxxxx\n"
+                         for i in range(250000))
+        rbig, err = c.tool("fast_search", {"pattern": "NEEDLE", "path": bigf,
+                                           "limit": 10})
+        check("fast_search capped flag true past 8MB rg output",
+              not err and rbig["success"] and rbig["capped"] is True and
+              rbig["shown"] == 10, str({k: rbig.get(k)
+                                        for k in ("success", "capped", "shown")}))
 
         # batch_search: the parallel member of the batching triad. Order
         # preserved, whole batch validated up front, per-op failures isolated.
@@ -233,6 +308,41 @@ def main():
         rt4, _ = c.tool("fast_tree", {"path": ttree + ".missing"})
         check("fast_tree missing dir", not rt4["success"])
 
+        # invalid glob must fail closed, not match literally
+        rbad, err = c.tool("fast_tree", {"path": ttree, "pattern": "["})
+        check("fast_tree invalid pattern",
+              not rbad["success"] and "invalid pattern" in rbad["error"],
+              str(rbad))
+
+        # symlinks: dir-symlink flagged (not followed as a dir), dangling
+        # link still listed with its flag
+        sl = os.path.join(td, "syms")
+        os.makedirs(os.path.join(sl, "real"))
+        with open(os.path.join(sl, "real", "inner.txt"), "w") as f:
+            f.write("x")
+        os.symlink(os.path.join(sl, "real"), os.path.join(sl, "dirlink"))
+        os.symlink(os.path.join(sl, "gone"), os.path.join(sl, "dangling"))
+        rsl, err = c.tool("fast_tree", {"path": sl})
+        entries = {os.path.basename(e["path"]): e
+                   for e in rsl.get("entries", [])}
+        check("fast_tree symlinks flagged, dangling listed",
+              not err and rsl["success"] and
+              entries.get("dirlink", {}).get("is_symlink") is True and
+              entries.get("dirlink", {}).get("is_dir") is False and
+              entries.get("dangling", {}).get("is_symlink") is True,
+              str(entries)[:300])
+
+        # exact fit: N entries with max_entries=N is NOT truncated
+        fit = os.path.join(td, "fit")
+        os.makedirs(fit)
+        for i in range(3):
+            with open(os.path.join(fit, f"f{i}.txt"), "w") as f:
+                f.write("x")
+        rfit, err = c.tool("fast_tree", {"path": fit, "max_entries": 3})
+        check("fast_tree exact fit not truncated",
+              not err and rfit["success"] and rfit["truncated"] is False and
+              len(rfit["entries"]) == 3, str(rfit)[:200])
+
         # warm_exec: the money lane — state must survive across calls
         rw, err = c.tool("warm_exec", {"command": "export TR_PROOF=alive$$ && cd /tmp"})
         check("warm_exec basic", not err and rw["success"] and rw["exit_code"] == 0)
@@ -257,6 +367,17 @@ def main():
         rw7, _ = c.tool("warm_exec", {"command": "echo $TR_PROOF", "reset": True})
         check("warm_exec reset clears state", rw7["success"] and rw7["stdout"] == "")
 
+        # newline in cwd must be rejected outright, not smuggled into the
+        # shell command line (regression: cwd was interpolated raw)
+        rn1, err = c.tool("warm_exec", {"command": "echo x", "cwd": "/tmp\n"})
+        check("warm_exec cwd newline rejected",
+              not rn1["success"] and
+              "cwd must not contain newline" in rn1["error"], str(rn1))
+        rn2, _ = c.tool("warm_exec", {"command": "echo y", "cwd": "a\nb"})
+        check("warm_exec cwd embedded newline rejected",
+              not rn2["success"] and
+              "cwd must not contain newline" in rn2["error"], str(rn2))
+
         # >8MB output must truncate with notice, keep exit_code, set flag;
         # small commands always carry the truncated field (regressions:
         # unbounded buffer / missing field)
@@ -269,6 +390,26 @@ def main():
         rt_sm, _ = c.tool("warm_exec", {"command": "echo hi"})
         check("warm_exec truncated flag present (false) on small output",
               rt_sm["truncated"] is False)
+
+        # write-wedge regression: STOP the warm shell mid-flight, then send
+        # a >64KB frame — the server must bound the wedged pipe write (rc
+        # 124), not hang forever, and the shell must respawn afterwards.
+        t_wedge = time.monotonic()
+        rp_, err = c.tool("warm_exec", {
+            "command": "(sleep 1; kill -STOP $$) & echo planted"})
+        check("warm_exec write-wedge: setup planted",
+              not err and rp_["success"] and "planted" in rp_["stdout"])
+        time.sleep(2.5)  # let the backgrounded STOPper freeze the shell
+        rwed, _ = c.tool("warm_exec", {"command": "# " + "A" * 200000,
+                                       "timeout": 3})
+        check("warm_exec write-wedge: >64KB frame bounded (rc 124, no hang)",
+              rwed["exit_code"] == 124 and time.monotonic() - t_wedge < 12,
+              f"rc={rwed.get('exit_code')} t={time.monotonic()-t_wedge:.1f}s")
+        rrec, err = c.tool("warm_exec", {"command": "echo recovered"})
+        check("warm_exec write-wedge: shell respawned after bounded write",
+              not err and rrec["success"] and "recovered" in rrec["stdout"] and
+              time.monotonic() - t_wedge < 15,
+              f"t={time.monotonic()-t_wedge:.1f}s")
 
         # batch_exec: failing command must raise MCP isError
         _, be_err = c.tool("batch_exec", {"commands": ["true", "false"]})
@@ -283,6 +424,15 @@ def main():
         check("batch_exec sequencing+state", not err and be["success"] and
               ber[1]["stdout"] == "flow@/tmp" and ber[2]["stdout"] == "third",
               str(ber))
+        # cwd param applies to the FIRST command only; a cd inside the
+        # batch still flows into later commands (regression: cwd was
+        # re-applied around every member)
+        be4, err = c.tool("batch_exec", {"commands": ["cd /etc", "pwd"],
+                                         "cwd": "/tmp"})
+        be4r = be4["results"]
+        check("batch_exec cwd applies to first command only",
+              not err and be4["success"] and be4r[0]["exit_code"] == 0 and
+              be4r[1]["stdout"] == "/etc", str(be4r))
         be2, _ = c.tool("batch_exec", {"commands": ["sleep 5", "echo back"],
                                        "timeout": 1})
         be2r = be2["results"]

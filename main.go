@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -211,6 +212,9 @@ func render(lines []string, size int64, offset, limit int) string {
 			offset = 1
 		}
 	}
+	if offset < 1 { // defensive: callers clamp 0→1, render must never index -1
+		offset = 1
+	}
 	if offset > total {
 		return jmap(map[string]any{
 			"success": true, "content": "", "total_lines": total,
@@ -219,6 +223,9 @@ func render(lines []string, size int64, offset, limit int) string {
 				"(%d lines total). Retry with offset <= %d.", offset, total, total)})
 	}
 	end := offset + limit - 1
+	if end < offset || end > total { // defensive: clamps bound this already
+		end = total
+	}
 	var sb strings.Builder
 	nbytes := 0
 	clipped := false
@@ -365,16 +372,25 @@ type readOp struct {
 }
 
 func (o readOp) off() int {
-	if o.Offset != nil {
-		return *o.Offset
+	// 0 means "page 1" exactly like fastRead; negatives stay tail mode.
+	// Without the 0→1 clamp, render() indexes lines[-1] and panics.
+	if o.Offset == nil || *o.Offset == 0 {
+		return 1
 	}
-	return 1
+	return *o.Offset
 }
 func (o readOp) lim() int {
+	l := readDefaultLimit
 	if o.Limit != nil {
-		return *o.Limit
+		l = *o.Limit
 	}
-	return readDefaultLimit
+	if l < 1 {
+		l = 1
+	}
+	if l > readDefaultLimit {
+		l = readDefaultLimit
+	}
+	return l
 }
 
 func batchRead(ops []readOp) string {
@@ -472,8 +488,12 @@ func clampCtx(c int) int {
 }
 
 func searchRg(pattern, path, fileGlob string, caseSensitive bool, limit, offset, ctx int) string {
-	args := []string{"--line-number", "--no-heading", "--with-filename", "--color", "never",
-		"--encoding", "utf-8"}
+	// --json: rg emits a message stream (begin/match/context/end) instead of
+	// text rows, so paths, line numbers and content arrive in separate fields
+	// — no more "path:line:content" regex ambiguity (colons/dashes/CRs in
+	// content, "-N-" gutter fabrication, context rows re-parsed as matches).
+	args := []string{"--json", "--line-number", "--no-heading", "--with-filename",
+		"--color", "never", "--encoding", "utf-8"}
 	if !caseSensitive {
 		args = append(args, "-i")
 	}
@@ -481,8 +501,8 @@ func searchRg(pattern, path, fileGlob string, caseSensitive bool, limit, offset,
 		args = append(args, "-g", fileGlob)
 	}
 	if ctx > 0 {
-		// -C makes rg print "--" between disjoint groups and render context
-		// lines as "path-line-content" (hyphen) vs matches "path:line:content"
+		// -C n (clamped to 5 by the caller) makes rg emit context messages
+		// around each match; at 0 no context messages exist at all.
 		args = append(args, "-C", strconv.Itoa(ctx))
 	}
 	args = append(args, "-e", pattern, "--", resolvePath(path))
@@ -490,7 +510,8 @@ func searchRg(pattern, path, fileGlob string, caseSensitive bool, limit, offset,
 	defer cancel()
 	cmd := exec.CommandContext(rctx, rg(), args...)
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &limitedWriter{w: &stdout, max: maxOut}
+	lw := &limitedWriter{w: &stdout, max: maxOut}
+	cmd.Stdout = lw
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if rctx.Err() == context.DeadlineExceeded {
@@ -507,12 +528,15 @@ func searchRg(pattern, path, fileGlob string, caseSensitive bool, limit, offset,
 			return jerr("rg error: " + msg)
 		}
 	}
-	return collectHitsRg(stdout.String(), "rg", limit, offset, ctx)
+	return collectHitsJSON(stdout.String(), "rg", limit, offset, ctx, lw.capped)
 }
 
+// limitedWriter caps total bytes written; capped reports whether any byte
+// was dropped, i.e. the consumer only saw a prefix of the stream.
 type limitedWriter struct {
-	w   *bytes.Buffer
-	max int
+	w      *bytes.Buffer
+	max    int
+	capped bool
 }
 
 func (l *limitedWriter) Write(p []byte) (int, error) {
@@ -520,24 +544,18 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 	if remain > 0 {
 		if len(p) > remain {
 			l.w.Write(p[:remain])
+			l.capped = true
 		} else {
 			l.w.Write(p)
 		}
+	} else if len(p) > 0 {
+		l.capped = true
 	}
 	return len(p), nil
 }
 
-// hitLineRx parses rg's --line-number --no-heading "path:line:content" rows.
-// Non-greedy path + backtracking resolves colons inside the path
-// (co:lon/f.txt:1:hit), which SplitN(3) parsed wrong.
-var hitLineRx = regexp.MustCompile(`^(.+?):(\d+):(.*)$`)
-
-// collectHits parses rg output for context=0 searches; it is byte-identical
-// to the pre-context build (every non-empty row counts toward total_hits).
-func collectHits(out, engine string, limit, offset int) string {
-	return collectHitsRg(out, engine, limit, offset, 0)
-}
-
+// searchHit is one match row; Context is the optional gutter ("N-line" for
+// rows before the match, "N+line" for rows after), omitted when empty.
 type searchHit struct {
 	Path    string `json:"path"`
 	Line    int    `json:"line"`
@@ -545,165 +563,104 @@ type searchHit struct {
 	Context string `json:"context,omitempty"`
 }
 
-func envelopeHits(engine string, hits []searchHit, total, offset int, truncated bool) string {
+// envelopeHits renders the search envelope. capped=true means rg's 8MB
+// stdout cap was hit, so total_hits is a lower bound.
+func envelopeHits(engine string, hits []searchHit, total, offset int, truncated, capped bool) string {
 	return jmap(map[string]any{
 		"success": true, "engine": engine, "hits": hits,
 		"total_hits": total, "shown": len(hits),
-		"truncated": truncated || total > offset+len(hits)})
+		"truncated": truncated || total > offset+len(hits),
+		"capped":    capped,
+	})
 }
 
-// collectHitsRg parses rg's --line-number --no-heading output. With ctx==0
-// only "path:line:content" match rows exist and every non-empty row counts
-// (legacy behavior, garbage included). With ctx>0 rg also emits "--" group
-// separators and "path-line-content" context rows: only match rows count
-// toward total_hits; context rows render into a gutter string on the hit —
-// "N-line" for lines before the match, "N+line" for lines after it.
-//
-// The path/context separator is ambiguous ("a-1-b.txt-4-ctx" splits as
-// path="a-1-b.txt" line=4, and content may itself contain "-N-"), so every
-// context row is decomposed into ALL plausible "-digits-" splits from the
-// right, and the split consistent with the neighboring match's line number
-// is chosen once that match is seen.
-func collectHitsRg(out, engine string, limit, offset, ctx int) string {
-	if ctx == 0 {
-		hits := []searchHit{}
-		total := 0
-		for _, raw := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
-			if raw == "" {
-				continue
-			}
-			total++
-			if total <= offset || len(hits) >= limit {
-				continue
-			}
-			m := hitLineRx.FindStringSubmatch(raw)
-			if m == nil {
-				continue
-			}
-			no, _ := strconv.Atoi(m[2])
-			content := m[3]
-			if len(content) > maxLine {
-				content = content[:maxLine] + "... [truncated]"
-			}
-			hits = append(hits, searchHit{Path: m[1], Line: no, Content: content})
-		}
-		return envelopeHits(engine, hits, total, offset, false)
-	}
+// ctxLine is one parsed context message awaiting attachment.
+type ctxLine struct {
+	no   int
+	line string
+}
 
+// collectHitsJSON parses rg's --json message stream. Match messages carry
+// path/line_number/lines.text; context messages carry line_number/lines.text.
+// Grouping per the pinned contract: context rows seen before any match are
+// before-context of the FOLLOWING match; rows after a match are after-context
+// of the PRECEDING match (rg prints shared rows once, positioned after the
+// first match). Only match messages count toward total_hits; limit/offset
+// window matches exactly like the pre-JSON lane.
+func collectHitsJSON(out, engine string, limit, offset, ctx int, capped bool) string {
 	hits := []searchHit{}
 	total := 0
-	before := []ctxCandSet{} // context rows awaiting their match (after "--")
-	afterOpen := false       // context rows attach to the last hit as after-lines
-	for _, raw := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+	var pending []ctxLine // before-context rows awaiting their match
+	var last *searchHit   // last kept hit — after-context target
+	for _, raw := range strings.Split(out, "\n") {
 		if raw == "" {
 			continue
 		}
-		if raw == "--" {
-			before = nil
-			afterOpen = false
-			continue
+		// fresh struct per line: Unmarshal into a reused struct leaks
+		// stale fields from the previous message (type/data inheritance)
+		var msg struct {
+			Type string `json:"type"`
+			Data struct {
+				Path struct {
+					Text string `json:"text"`
+				} `json:"path"`
+				Lines struct {
+					Text string `json:"text"`
+				} `json:"lines"`
+				LineNumber int `json:"line_number"`
+			} `json:"data"`
 		}
-		m := hitLineRx.FindStringSubmatch(raw)
-		if m == nil {
-			cands := ctxCandidates(raw)
-			if len(cands) == 0 {
+		if json.Unmarshal([]byte(raw), &msg) != nil {
+			continue // truncated cap tail or stray — capped flag covers it
+		}
+		switch msg.Type {
+		case "begin": // new file: grouping state is per-file
+			pending = nil
+			last = nil
+		case "match":
+			total++
+			kept := total > offset && len(hits) < limit
+			line := stripOneCRLF(msg.Data.Lines.Text)
+			if !kept {
+				pending = nil
+				last = nil
 				continue
 			}
-			if afterOpen && len(hits) > 0 {
-				// after-line: smallest line number still above the last hit
-				pick := pickCtxCand(cands, hits[len(hits)-1].Line, false)
-				hits[len(hits)-1].Context = joinCtx(hits[len(hits)-1].Context,
-					strconv.Itoa(pick.no)+"+"+clampLine(pick.content))
+			h := searchHit{
+				Path:    msg.Data.Path.Text,
+				Line:    msg.Data.LineNumber,
+				Content: clampLine(line),
+			}
+			if len(pending) > 0 {
+				rows := make([]string, 0, len(pending))
+				for _, p := range pending {
+					rows = append(rows, strconv.Itoa(p.no)+"-"+clampLine(p.line))
+				}
+				h.Context = strings.Join(rows, "\n")
+				pending = nil
+			}
+			hits = append(hits, h)
+			last = &hits[len(hits)-1]
+		case "context":
+			line := stripOneCRLF(msg.Data.Lines.Text)
+			if last != nil {
+				last.Context = joinCtx(last.Context,
+					strconv.Itoa(msg.Data.LineNumber)+"+"+clampLine(line))
 			} else {
-				before = append(before, ctxCandSet{cands: cands})
-			}
-			continue
-		}
-		total++
-		kept := total > offset && len(hits) < limit
-		if !kept {
-			before = nil
-			afterOpen = false
-			continue
-		}
-		no, _ := strconv.Atoi(m[2])
-		content := clampLine(m[3])
-		h := searchHit{Path: m[1], Line: no, Content: content}
-		if len(before) > 0 {
-			// before-lines sit directly above this match: take the largest
-			// candidate line number still below it
-			rows := make([]string, 0, len(before))
-			for _, p := range before {
-				pick := pickCtxCand(p.cands, no, true)
-				rows = append(rows, strconv.Itoa(pick.no)+"-"+clampLine(pick.content))
-			}
-			h.Context = strings.Join(rows, "\n")
-			before = nil
-		}
-		hits = append(hits, h)
-		afterOpen = true
-	}
-	return envelopeHits(engine, hits, total, offset, false)
-}
-
-type ctxCand struct {
-	no      int
-	content string
-}
-
-type ctxCandSet struct {
-	cands []ctxCand
-}
-
-// ctxCandidates decomposes "path-line-content" into every plausible split
-// where a hyphen preceded by digits ends the path, rightmost first. The
-// rightmost split is the usual case (".../file-12-text" -> line 12); the
-// rest cover paths containing "-N-" segments.
-func ctxCandidates(raw string) []ctxCand {
-	var out []ctxCand
-	for i := len(raw) - 1; i > 0; i-- {
-		if raw[i] != '-' {
-			continue
-		}
-		j := i - 1
-		for j >= 0 && raw[j] >= '0' && raw[j] <= '9' {
-			j--
-		}
-		if j == i-1 { // no digits before this hyphen
-			continue
-		}
-		no, err := strconv.Atoi(raw[j+1 : i])
-		if err != nil || no < 1 {
-			continue
-		}
-		out = append(out, ctxCand{no, raw[i+1:]})
-		if len(out) >= 8 {
-			break
-		}
-	}
-	return out
-}
-
-// pickCtxCand chooses the split consistent with the neighbor line L: before
-// context takes the largest candidate below L, after context the smallest
-// above L. Falls back to the first (rightmost) candidate when nothing fits.
-func pickCtxCand(cands []ctxCand, line int, before bool) ctxCand {
-	best := -1
-	for i, c := range cands {
-		if before && c.no < line || !before && c.no > line {
-			if best < 0 {
-				best = i
-				continue
-			}
-			if before && c.no > cands[best].no || !before && c.no < cands[best].no {
-				best = i
+				pending = append(pending, ctxLine{msg.Data.LineNumber, line})
 			}
 		}
 	}
-	if best < 0 {
-		return cands[0]
-	}
-	return cands[best]
+	return envelopeHits(engine, hits, total, offset, false, capped)
+}
+
+// stripOneCRLF removes exactly one trailing "\n" and then one trailing "\r"
+// (rg's lines.text keeps the raw line terminator; CRLF content must not
+// leak a stray CR into the envelope).
+func stripOneCRLF(s string) string {
+	s = strings.TrimSuffix(s, "\n")
+	s = strings.TrimSuffix(s, "\r")
+	return s
 }
 
 func clampLine(s string) string {
@@ -728,6 +685,11 @@ func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offse
 	rx, err := regexp.Compile(pat)
 	if err != nil {
 		return jerr(fmt.Sprintf("invalid regex: %v", err))
+	}
+	if fileGlob != "" {
+		if _, err := filepath.Match(fileGlob, ""); err != nil {
+			return jerr("invalid pattern: " + fileGlob)
+		}
 	}
 	root := resolvePath(path)
 	hits := []searchHit{}
@@ -812,7 +774,7 @@ func searchWalk(pattern, path, fileGlob string, caseSensitive bool, limit, offse
 		}
 		return nil
 	})
-	return envelopeHits("walk", hits, total, offset, timedOut)
+	return envelopeHits("walk", hits, total, offset, timedOut, false)
 }
 
 // ctxRow renders one context-gutter row, clamped like match lines.
@@ -924,15 +886,21 @@ func treeSkip(name string) bool {
 }
 
 type treeEntry struct {
-	Path  string `json:"path"`
-	IsDir bool   `json:"is_dir"`
-	Size  int64  `json:"size"`
-	Mtime int64  `json:"mtime"` // unix seconds
+	Path      string `json:"path"`
+	IsDir     bool   `json:"is_dir"`
+	IsSymlink bool   `json:"is_symlink"`
+	Size      int64  `json:"size"`
+	Mtime     int64  `json:"mtime"` // unix seconds
 }
 
 func fastTree(path string, maxDepth, maxEntries int, pattern string) string {
 	if !useFastlane {
 		return jerr("TOOLRUSH_FASTLANE=0 — lane disabled; use the harness's native listing")
+	}
+	if pattern != "" {
+		if _, err := filepath.Match(pattern, ""); err != nil {
+			return jerr("invalid pattern: " + pattern)
+		}
 	}
 	root := resolvePath(path)
 	st, err := os.Stat(root)
@@ -972,7 +940,9 @@ func fastTree(path string, maxDepth, maxEntries int, pattern string) string {
 		}
 		ordered = append(dirs, ordered...)
 		// pass 1: list this directory's entries (depth budget already
-		// enforced by the descent guard — we only get here within budget)
+		// enforced by the descent guard — we only get here within budget).
+		// Truncation is flagged only when an entry that WOULD be listed is
+		// omitted due to the budget — an exact fit is not truncated.
 		for _, e := range ordered {
 			if truncated {
 				return
@@ -986,20 +956,25 @@ func fastTree(path string, maxDepth, maxEntries int, pattern string) string {
 					continue // filtered out, but dirs are still descended into
 				}
 			}
-			fi, err := e.Info()
-			if err != nil {
-				continue
-			}
-			entries = append(entries, treeEntry{
-				Path:  filepath.Join(dir, name),
-				IsDir: e.IsDir(),
-				Size:  fi.Size(),
-				Mtime: fi.ModTime().Unix(),
-			})
 			if len(entries) >= maxEntries {
 				truncated = true
 				return
 			}
+			fp := filepath.Join(dir, name)
+			// Lstat semantics (parity with the Python reference): a symlink
+			// reports is_dir:false/is_symlink:true and the LINK's own
+			// size/mtime; dangling links are listed, never descended into.
+			fi, err := os.Lstat(fp)
+			if err != nil {
+				continue
+			}
+			entries = append(entries, treeEntry{
+				Path:      fp,
+				IsDir:     fi.IsDir(),
+				IsSymlink: fi.Mode()&os.ModeSymlink != 0,
+				Size:      fi.Size(),
+				Mtime:     fi.ModTime().Unix(),
+			})
 		}
 		// pass 2: descend into child dirs (children of the root are depth 1,
 		// so a dir listed at `depth` is descended only when depth < maxDepth)
@@ -1032,14 +1007,23 @@ func fastTree(path string, maxDepth, maxEntries int, pattern string) string {
 
 const outTruncNotice = "\n[output truncated at 8MB]"
 
+// warmShell is ONE persistent bash. mu serializes run() (structural fields:
+// cmd/stdin/lines/cwd); alive is an atomic so doctor can peek liveness
+// without blocking behind a running command.
 type warmShell struct {
 	mu    sync.Mutex
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
 	lines chan *string // nil = shell died
 	cwd   string
-	alive bool
+	alive atomic.Bool
 }
+
+// maxShellLine caps materialization of a single reader line at 1MB: a
+// runaway background job printing one gigantic line must not balloon RSS
+// before the 8MB call-cap can drop it. The line keeps being consumed (pipe
+// flow) but the excess is discarded.
+const maxShellLine = 1 << 20
 
 func newLineChan() chan *string { return make(chan *string, 65536) }
 
@@ -1057,40 +1041,72 @@ func (s *warmShell) spawnLocked(cwd string) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		s.alive = false
+		s.alive.Store(false)
 		return
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {
-		s.alive = false
+		_ = stdin.Close()
+		s.alive.Store(false)
 		return
 	}
 	cmd.Stdout = pw
 	cmd.Stderr = pw
 	if err := cmd.Start(); err != nil {
-		s.alive = false
+		_ = stdin.Close()
+		_ = pr.Close()
+		_ = pw.Close()
+		s.alive.Store(false)
 		return
 	}
 	_ = pw.Close() // reader owns the pipe now
 	s.cmd = cmd
 	s.stdin = stdin
 	s.lines = newLineChan()
-	s.alive = true
+	s.alive.Store(true)
 	ch := s.lines
 	go func() {
 		// Sole reaper: after EOF the shell is gone — close the pipe and
 		// Wait() to reap the zombie, then report the death. No one else
 		// may Wait (double-Wait is an error).
-		r := bufio.NewReader(pr)
+		r := bufio.NewReaderSize(pr, 64<<10)
+		// readLine consumes exactly one line. Long lines are ReadSliced in
+		// fragments; materialization stops at maxShellLine but consumption
+		// continues to the newline so the pipe never backs up.
+		readLine := func() (string, bool) {
+			var sb strings.Builder
+			over := false
+			for {
+				frag, err := r.ReadSlice('\n')
+				if len(frag) > 0 && !over {
+					if sb.Len()+len(frag) > maxShellLine {
+						if keep := maxShellLine - sb.Len(); keep > 0 {
+							sb.Write(frag[:keep])
+						}
+						over = true
+					} else {
+						sb.Write(frag)
+					}
+				}
+				if err == nil {
+					return sb.String(), true
+				}
+				if err == bufio.ErrBufferFull {
+					continue // line continues past the buffer
+				}
+				return sb.String(), sb.Len() > 0 // EOF: emit partial, then done
+			}
+		}
 		for {
-			line, err := r.ReadString('\n')
-			if line != "" {
+			line, ok := readLine()
+			if ok {
 				l := strings.TrimRight(line, "\n")
 				ch <- &l
 			}
-			if err != nil {
+			if !ok {
 				_ = pr.Close()
 				_ = cmd.Wait()
+				s.alive.Store(false)
 				ch <- nil
 				return
 			}
@@ -1099,11 +1115,11 @@ func (s *warmShell) spawnLocked(cwd string) {
 }
 
 func (s *warmShell) killLocked() {
-	if s.alive && s.cmd != nil && s.cmd.Process != nil {
+	if s.alive.Load() && s.cmd != nil && s.cmd.Process != nil {
 		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL) // whole tree
 		_ = s.cmd.Process.Kill()
 	}
-	s.alive = false
+	s.alive.Store(false)
 	// No Wait here: the reader goroutine of this very shell reaps it once
 	// the pipe hits EOF. killLocked only signals.
 }
@@ -1121,17 +1137,26 @@ func (s *warmShell) reset() {
 func (s *warmShell) run(command, cwd string, timeout time.Duration) (string, int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.alive {
+	if !s.alive.Load() {
 		s.spawnLocked(cwd)
 		bump("shell_respawns")
 	}
-	if !s.alive {
+	if !s.alive.Load() {
 		return "", -1, false
 	}
-	// drain strays from backgrounded jobs of earlier calls
+	// drain strays from backgrounded jobs of earlier calls; a nil sentinel
+	// means the shell died between calls — respawn BEFORE writing the frame
+	// instead of misreporting "shell died mid-command".
 	for {
 		select {
-		case <-s.lines:
+		case lp := <-s.lines:
+			if lp == nil {
+				s.spawnLocked(cwd)
+				bump("shell_respawns")
+				if !s.alive.Load() {
+					return "", -1, false
+				}
+			}
 		default:
 			goto drained
 		}
@@ -1146,19 +1171,42 @@ drained:
 	begin := "TRB" + mid
 	endP := "TRE" + mid
 	// Markers lead with \n so unterminated output can never glue them onto
-	// the last line. END carries rc AND $PWD: real cwd read back from the
-	// shell, so `cd` inside a command can never desync the tracker.
-	frame := "printf '%s\\n' '" + begin + "'; { " + command + "\n}; _rc=$?; " +
+	// the last line (the begin marker's leading \n also terminates any stray
+	// unterminated line from a previous background job). END carries rc AND
+	// $PWD: real cwd read back from the shell, so `cd` inside a command can
+	// never desync the tracker.
+	frame := "printf '\\n%s\\n' '" + begin + "'; { " + command + "\n}; _rc=$?; " +
 		"printf '\\n%s:%d:%s\\n' '" + endP + "' $_rc \"$PWD\"\n"
-	if _, err := io.WriteString(s.stdin, frame); err != nil {
-		s.alive = false
-		return "", -1, false
+	// The frame write must not hold the shell hostage: a stopped (SIGSTOP)
+	// shell with a frame bigger than the 64KB pipe buffer would block
+	// forever, deadlocking every lane behind s.mu. Write in a goroutine and
+	// race it against the call's remaining deadline; on timeout kill the
+	// tree — the blocked writer then unblocks with EPIPE and exits (the
+	// channel is buffered, so no goroutine leaks).
+	deadline := time.Now().Add(timeout)
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(s.stdin, frame)
+		writeErr <- err
+	}()
+	wt := time.NewTimer(time.Until(deadline))
+	select {
+	case err := <-writeErr:
+		wt.Stop()
+		if err != nil {
+			s.alive.Store(false)
+			return "", -1, false
+		}
+	case <-wt.C:
+		s.killLocked()
+		return fmt.Sprintf("\n[timed out after %ds — "+
+			"command tree killed, shell will respawn]", int(timeout.Seconds())), 124, false
 	}
 	var out strings.Builder
 	nbytes := 0
 	truncated := false
 	rc := -1
-	deadline := time.Now().Add(timeout)
+	begun := false // nothing is output before the begin marker line
 	endMarker := endP + ":"
 	for {
 		remain := time.Until(deadline)
@@ -1173,12 +1221,23 @@ drained:
 		case lp := <-s.lines:
 			timer.Stop()
 			if lp == nil { // shell died mid-command; do NOT retry
-				s.alive = false
+				s.alive.Store(false)
 				return out.String(), -1, truncated
 			}
 			line := *lp
-			if line == begin {
-				continue
+			if !begun {
+				// pre-begin state: the begin marker's leading \n surfaces
+				// as an empty line — discard it (and any other empties) so
+				// it never counts as command output.
+				if line == "" {
+					continue
+				}
+				if line == begin {
+					begun = true
+					continue
+				}
+				// stray terminated line from an earlier background job:
+				// pass it through as output
 			}
 			if strings.HasPrefix(line, endMarker) {
 				parts := strings.SplitN(line, ":", 3)
@@ -1225,6 +1284,11 @@ var shell = &warmShell{}
 func warmExec(command, cwd string, timeoutSec int, reset bool) string {
 	if strings.TrimSpace(command) == "" {
 		return jerr("command must be a non-empty string")
+	}
+	if strings.ContainsAny(cwd, "\n\r") {
+		// a newline in $PWD would split the END marker and corrupt cwd
+		// tracking (verified wrong-directory execution)
+		return jerr("cwd must not contain newline characters")
 	}
 	if timeoutSec < 1 {
 		timeoutSec = 1
@@ -1291,6 +1355,9 @@ func batchExec(commands []string, cwd string, timeoutSec int) string {
 	if len(commands) > batchMax {
 		return jerr(fmt.Sprintf("batch too large: %d > %d — split it", len(commands), batchMax))
 	}
+	if strings.ContainsAny(cwd, "\n\r") {
+		return jerr("cwd must not contain newline characters")
+	}
 	for i, c := range commands {
 		if strings.TrimSpace(c) == "" {
 			return jerr(fmt.Sprintf("command %d invalid: must be a non-empty string", i))
@@ -1301,7 +1368,13 @@ func batchExec(commands []string, cwd string, timeoutSec int) string {
 	fresh := false
 	allOK := true
 	for i, c := range commands {
-		r := warmExec(c, cwd, timeoutSec, false)
+		// cwd applies to the FIRST command only: subsequent commands
+		// inherit the shell's state (cd/export flow between commands).
+		cwdArg := ""
+		if i == 0 {
+			cwdArg = cwd
+		}
+		r := warmExec(c, cwdArg, timeoutSec, false)
 		if fresh {
 			var m map[string]any
 			if json.Unmarshal([]byte(r), &m) == nil {
@@ -1347,9 +1420,8 @@ func doctor() string {
 		snap[k] = v
 	}
 	statsMu.Unlock()
-	shell.mu.Lock()
-	alive := shell.alive
-	shell.mu.Unlock()
+	// atomic alive: doctor never blocks behind a long-running command
+	alive := shell.alive.Load()
 	return jmap(map[string]any{
 		"success": true, "version": version,
 		"go":       strings.TrimPrefix(runtime.Version(), "go"),
@@ -1396,10 +1468,12 @@ func init() {
 						"required": []string{"path"}}}},
 				"required": []string{"ops"}}},
 		{"name": "fast_search",
-			"description": desc("Content search via direct ripgrep transport (respects " +
-				".gitignore, real regex grammar). Falls back to a pure walk " +
-				"when rg is unavailable. context=N (0-5) adds N lines of " +
-				"gutter around each hit: \"L-line\" before, \"L+line\" after."),
+			"description": desc("Content search via direct ripgrep transport " +
+				"(respects .gitignore, real regex grammar, --json parsing). " +
+				"Falls back to a pure walk when rg is unavailable. context=N " +
+				"(0-5) adds N lines of gutter around each hit: \"L-line\" " +
+				"before, \"L+line\" after. Envelope always carries \"capped\": " +
+				"true means total_hits is a lower bound (8MB output cap hit)."),
 			"inputSchema": map[string]any{"type": "object",
 				"properties": map[string]any{
 					"pattern":        map[string]any{"type": "string"},
@@ -1416,9 +1490,11 @@ func init() {
 				"the batch wall time approaches the slowest op, not the sum " +
 				"(unlike batch_read, serial by design). Input order " +
 				"preserved; the whole batch is validated before anything " +
-				"runs; per-op failures are isolated. Each op: {pattern, " +
-				"path, file_glob?, case_sensitive?, context?, limit?, " +
-				"offset?}."),
+				"runs; per-op failures are isolated (that op's result is an " +
+				"error envelope). Each op envelope carries \"capped\": true " +
+				"means that op's total_hits is a lower bound. Each op: " +
+				"{pattern, path, file_glob?, case_sensitive?, context?, " +
+				"limit?, offset?}."),
 			"inputSchema": map[string]any{"type": "object",
 				"properties": map[string]any{
 					"ops": map[string]any{"type": "array", "items": map[string]any{
@@ -1437,10 +1513,13 @@ func init() {
 			"description": desc("Budgeted directory listing: deterministic " +
 				"dirs-first, alphabetical order; depth (1-10, default 3) and " +
 				"entry (1-5000, default 500) budgets; optional basename " +
-				"pattern filter (dirs matching it are still descended). " +
-				"Skips .git, node_modules, __pycache__, .venv, target, " +
-				"dist, build and *_cache. No .gitignore parsing — use " +
-				"pattern= to narrow."),
+				"pattern filter (invalid patterns error; dirs matching the " +
+				"filter are still descended). Entries always carry " +
+				"is_symlink and use lstat semantics: a symlink reports its " +
+				"own size/mtime, dangling links are listed, and symlinked " +
+				"dirs are never descended into. Skips .git, node_modules, " +
+				"__pycache__, .venv, target, dist, build and *_cache. No " +
+				".gitignore parsing — use pattern= to narrow."),
 			"inputSchema": map[string]any{"type": "object",
 				"properties": map[string]any{
 					"path":        map[string]any{"type": "string"},
@@ -1592,7 +1671,10 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			Offset *int   `json:"offset"`
 			Limit  *int   `json:"limit"`
 		}
-		if err := json.Unmarshal(args, &a); err != nil || a.Path == "" {
+		if err := json.Unmarshal(args, &a); err != nil {
+			return jerr("invalid arguments: " + err.Error()), true, false
+		}
+		if a.Path == "" {
 			return jerr("path must be a non-empty string"), true, false
 		}
 		off, lim := 1, readDefaultLimit
@@ -1609,7 +1691,7 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			Ops []readOp `json:"ops"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
-			return jerr("ops must be a non-empty list of {path, offset?, limit?}"), true, false
+			return jerr("invalid arguments: " + err.Error()), true, false
 		}
 		r := batchRead(a.Ops)
 		return r, envIsError(r), false
@@ -1624,7 +1706,7 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			Offset        *int   `json:"offset"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
-			return jerr("invalid arguments"), true, false
+			return jerr("invalid arguments: " + err.Error()), true, false
 		}
 		cs := true
 		if a.CaseSensitive != nil {
@@ -1648,7 +1730,7 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			Ops []searchOp `json:"ops"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
-			return jerr("ops must be a non-empty list of {pattern, path, file_glob?, case_sensitive?, context?, limit?, offset?}"), true, false
+			return jerr("invalid arguments: " + err.Error()), true, false
 		}
 		r := batchSearch(a.Ops)
 		return r, envIsError(r), false
@@ -1659,7 +1741,10 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			MaxEntries *int   `json:"max_entries"`
 			Pattern    string `json:"pattern"`
 		}
-		if err := json.Unmarshal(args, &a); err != nil || a.Path == "" {
+		if err := json.Unmarshal(args, &a); err != nil {
+			return jerr("invalid arguments: " + err.Error()), true, false
+		}
+		if a.Path == "" {
 			return jerr("path must be a non-empty string"), true, false
 		}
 		depth, entries := 3, 500
@@ -1679,7 +1764,7 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			Reset   bool   `json:"reset"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
-			return jerr("invalid arguments"), true, false
+			return jerr("invalid arguments: " + err.Error()), true, false
 		}
 		to := execDefaultTimeout
 		if a.Timeout != nil {
@@ -1694,7 +1779,7 @@ func dispatchTool(name string, args json.RawMessage) (string, bool, bool) {
 			Timeout  *int     `json:"timeout"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
-			return jerr("commands must be a non-empty list of strings"), true, false
+			return jerr("invalid arguments: " + err.Error()), true, false
 		}
 		to := execDefaultTimeout
 		if a.Timeout != nil {

@@ -9,8 +9,9 @@ portable; the lanes are. This server exposes them as MCP tools over stdio:
   fast_read     in-process read: one open()/stat, line-number gutter, BOM
                 strip, binary sniff, beyond-EOF hint, mtime-keyed cache.
                 (port of toolrush.py P1+P3)
-  batch_read    1..16 reads on a 4-worker pool through ONE call, input order
-                preserved, whole batch validated before dispatch.
+  batch_read    1..16 reads through ONE call, input order preserved, whole
+                batch validated before dispatch — serial by design (a thread
+                pool measured slower; the win is one MCP call).
                 (port of toolrush.py P2 / v2 parallel RPC lane)
   fast_search   content search. Primary: direct rg transport (real ignore
                 files, real regex grammar — v2's "one engine, accelerated
@@ -50,6 +51,7 @@ import queue
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -57,7 +59,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"
 
 USE_FASTLANE = os.environ.get("TOOLRUSH_FASTLANE", "1") == "1"
 USE_SEARCH = os.environ.get("TOOLRUSH_SEARCH", "1") == "1"
@@ -117,6 +119,16 @@ def _resolve(path):
     return p.resolve()
 
 
+def _split_lines(text):
+    """Split on \n ONLY (after folding \r\n), dropping the single trailing
+    artifact line — Go parity. str.splitlines() would also break on \v \f
+    \x1c-\x1e \x85 \u2028 \u2029, which Go and rg do not."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def _decode_store(rp, st, raw):
     """Decode+split+cache-store. GIL-held CPU: called from the MAIN thread
     only (pooling it measured slower than serial). Returns (lines, err)."""
@@ -126,7 +138,7 @@ def _decode_store(rp, st, raw):
         text = raw.decode("utf-8-sig")  # strips BOM like upstream _strip_bom
     except UnicodeDecodeError:
         return None, "binary file (not UTF-8 decodable)"
-    lines = text.splitlines()
+    lines = _split_lines(text)
     # Byte budget: serving the read is fine, but caching a huge file
     # multiplies RSS (lines + raw copies). Skip the store.
     if st.st_size <= CACHE_FILE_MAX:
@@ -171,7 +183,7 @@ def _render(lines, size, offset, limit):
         if len(line) > MAX_LINE:
             line = line[:MAX_LINE] + "... [truncated]"
         row = f"{i}\t{line}"
-        nbytes += len(row) + 1
+        nbytes += len(row.encode("utf-8")) + 1  # MAX_READ_BYTES is a BYTE cap
         if nbytes > MAX_READ_BYTES:
             clipped = True
             end = i - 1
@@ -195,7 +207,10 @@ def _stream_read(rp, st, offset, limit):
         window = list(itertools.islice(f, offset - 1, offset - 1 + limit))
     gutter = []
     for i, line in enumerate(window, start=offset):
-        line = line.rstrip("\n")
+        if line.endswith("\n"):
+            line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]  # \r\n folding, same as _split_lines
         if len(line) > MAX_LINE:
             line = line[:MAX_LINE] + "... [truncated]"
         gutter.append(f"{i}\t{line}")
@@ -231,6 +246,8 @@ def fast_read(path, offset=1, limit=READ_DEFAULT_LIMIT):
     """In-process read, ToolRush v1 P1/P3 semantics, harness-neutral gutter."""
     if not USE_FASTLANE:
         return _err("TOOLRUSH_FASTLANE=0 — lane disabled; use the harness's native read")
+    if not isinstance(path, str) or not path:
+        return _err("path must be a non-empty string")
     try:
         offset = int(offset)
         limit = int(limit)
@@ -277,6 +294,22 @@ def batch_read(ops):
             return _err(f"op {i} invalid: each op needs a string 'path'")
     _STATS["batch_read"] += 1
 
+    # Per-op page clamping, identical to fast_read: offset 0 -> page 1
+    # (negatives stay tail mode), limit into [1, 1000]. A degenerate
+    # offset=0 op would otherwise render a wrapped page on a cache hit
+    # (fast_read clamped, the probe path did not).
+    norm = []
+    for op in ops:
+        try:
+            off = int(op.get("offset", 1))
+            lim = int(op.get("limit", READ_DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            norm.append(None)
+            continue
+        if off == 0:
+            off = 1
+        norm.append((off, max(1, min(lim, READ_DEFAULT_LIMIT))))
+
     # Cache hits are served synchronously; misses run SERIALLY too. A thread
     # pool was measured SLOWER on every filesystem here (NTFS 31.8 vs 20.7ms,
     # tmpfs 6.1 vs 2.3ms for 16 files): reads are page-cache fast, while
@@ -287,8 +320,10 @@ def batch_read(ops):
     probes = [None] * len(ops)
     misses = []
     for i, op in enumerate(ops):
-        pr = _probe(op["path"], op.get("offset", 1),
-                    op.get("limit", READ_DEFAULT_LIMIT))
+        if norm[i] is None:
+            results[i] = _err("offset and limit must be integers")
+            continue
+        pr = _probe(op["path"], norm[i][0], norm[i][1])
         probes[i] = pr
         if isinstance(pr, str):
             results[i] = pr
@@ -298,16 +333,15 @@ def batch_read(ops):
     for i in misses:
         op = ops[i]
         pr = probes[i]
+        off, lim = norm[i]
         if isinstance(pr, tuple):  # cold-but-probed: complete without re-stat
             _, rp, st = pr
             lines, err = _get_lines(rp, st)
             _STATS["fast_read"] += 1
             results[i] = (_err(err) if err else
-                          _render(lines, st.st_size, op.get("offset", 1),
-                                  op.get("limit", READ_DEFAULT_LIMIT)))
+                          _render(lines, st.st_size, off, lim))
         else:
-            results[i] = fast_read(op["path"], op.get("offset", 1),
-                                   op.get("limit", READ_DEFAULT_LIMIT))
+            results[i] = fast_read(op["path"], off, lim)
     # Inner results are already valid JSON texts — embed raw. json.dumps on
     # the outer dict would re-escape ~1.6MB of content per batch (+6ms).
     return '{"success":true,"results":[' + ",".join(results) + "]}"
@@ -318,10 +352,9 @@ def batch_read(ops):
 _RG = None
 _RGVER = None
 
-# Parses rg's --line-number --no-heading "path:line:content" rows. The
-# non-greedy path + backtracking resolves colons inside the path
-# (co:lon/f.txt:1:hit), which a plain partition(":") misparsed.
-_HIT_LINE_RX = re.compile(r"^(.+?):(\d+):(.*)$")
+# rg lane: --json message stream (one JSON object per line; types
+# begin/match/context/end). Paths, line numbers and content arrive as
+# structured fields — no row regex, no colon-in-path ambiguity.
 
 
 def _clamp_ctx(c):
@@ -343,10 +376,20 @@ def _rg():
     return _RG
 
 
+def _json_line_text(data):
+    """data.lines.text with exactly one trailing \n and one trailing \r
+    stripped (rg terminates each reported line with \n)."""
+    text = (data.get("lines") or {}).get("text", "")
+    if text.endswith("\n"):
+        text = text[:-1]
+    if text.endswith("\r"):
+        text = text[:-1]
+    return text
+
+
 def _search_rg(pattern, path, file_glob, case_sensitive, limit, offset,
                context=0):
-    cmd = [_rg(), "--line-number", "--no-heading", "--with-filename",
-           "--color", "never", "--encoding", "utf-8"]
+    cmd = [_rg(), "--json", "--color", "never", "--encoding", "utf-8"]
     if not case_sensitive:
         cmd.append("-i")
     if file_glob:
@@ -355,133 +398,135 @@ def _search_rg(pattern, path, file_glob, case_sensitive, limit, offset,
         cmd += ["-C", str(context)]
     cmd += ["-e", pattern, "--", str(_resolve(path))]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=SEARCH_TIMEOUT)
-    except subprocess.TimeoutExpired:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+    except OSError as e:
+        return _err(f"rg failed to start: {e}")
+    # Bounded accumulation: read stdout via a drain thread and stop at
+    # MAX_OUT total — then kill rg and mark the envelope capped (total_hits
+    # becomes a lower bound).
+    buf = bytearray()
+    drained = threading.Event()
+
+    def _drain():
+        while True:
+            try:
+                chunk = proc.stdout.read(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            room = MAX_OUT - len(buf)
+            if room > 0:
+                buf.extend(chunk[:room])
+            if len(buf) >= MAX_OUT:
+                break  # cap hit: stop accumulating; caller kills rg
+        drained.set()
+
+    threading.Thread(target=_drain, daemon=True).start()
+    if not drained.wait(SEARCH_TIMEOUT):
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
         return _err(f"rg timed out after {SEARCH_TIMEOUT}s")
-    if r.returncode == 2:
-        return _err("rg error: " + r.stderr.decode("utf-8", "replace")[:500])
-    text = r.stdout.decode("utf-8", "replace")
-    if context > 0:
-        return _collect_hits_ctx(text, "rg", limit, offset)
+    capped = len(buf) >= MAX_OUT
+    if capped:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.returncode == 2:
+        return _err("rg error: " +
+                    proc.stderr.read().decode("utf-8", "replace")[:500])
     hits = []
     total = 0
-    for raw in text.splitlines():
+    before = []   # (line_no, text) context rows awaiting the FOLLOWING match
+    prev = None   # (path, line_no) of the last SHOWN match (after-context sink)
+    for raw in buf.decode("utf-8", "replace").splitlines():
         if not raw:
             continue
-        total += 1
-        if total <= offset or len(hits) >= limit:
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            continue  # truncated tail line when capped
+        mtype = msg.get("type")
+        data = msg.get("data") or {}
+        if mtype in ("begin", "end"):  # file boundary: no cross-file ctx
+            before = []
+            prev = None
             continue
-        m = _HIT_LINE_RX.match(raw)
-        if m is None:
-            continue
-        no = int(m.group(2))
-        line = m.group(3)
-        if len(line) > MAX_LINE:
-            line = line[:MAX_LINE] + "... [truncated]"
-        hits.append({"path": m.group(1), "line": no, "content": line})
+        if mtype == "match":
+            p = (data.get("path") or {}).get("text", "")
+            no = data.get("line_number")
+            total += 1
+            if total <= offset or len(hits) >= limit:
+                before = []
+                prev = None
+                continue
+            h = {"path": p, "line": no,
+                 "content": _clamp_line(_json_line_text(data))}
+            if before:
+                h["context"] = "\n".join(f"{b}-{_clamp_line(t)}"
+                                         for b, t in before)
+                before = []
+            hits.append(h)
+            prev = (p, no)
+        elif mtype == "context":
+            no = data.get("line_number")
+            if no is None:  # group separator (rg prints "--" as a ctx row)
+                before = []
+                prev = None
+                continue
+            p = (data.get("path") or {}).get("text", "")
+            text = _json_line_text(data)
+            # rg group semantics: within C lines of the preceding match the
+            # row is that match's after-context ("N+"); otherwise it belongs
+            # to the FOLLOWING match ("N-"). --json emits no separator
+            # between disjoint groups, so the C-window is the boundary.
+            if prev is not None and p == prev[0] and no <= prev[1] + context:
+                row = f"{no}+{_clamp_line(text)}"
+                c = hits[-1].get("context")
+                hits[-1]["context"] = f"{c}\n{row}" if c else row
+            else:
+                before.append((no, text))
+        # summary: ignored
     return _j({"success": True, "engine": "rg", "hits": hits,
                "total_hits": total, "shown": len(hits),
-               "truncated": total > offset + len(hits)})
+               "truncated": capped or total > offset + len(hits),
+               "capped": capped})
 
 
 def _clamp_line(s):
     return s[:MAX_LINE] + "... [truncated]" if len(s) > MAX_LINE else s
 
 
-def _ctx_candidates(raw):
-    """Decompose "path-line-content" into every plausible split where a
-    hyphen preceded by digits ends the path, rightmost first. The rightmost
-    split is the usual case (".../file-12-text" -> line 12); the rest cover
-    paths containing "-N-" segments. The split consistent with the
-    neighboring match's line number is chosen once that match is seen."""
-    out = []
-    for i in range(len(raw) - 1, 0, -1):
-        if raw[i] != "-":
-            continue
-        j = i - 1
-        while j >= 0 and raw[j].isdigit():
-            j -= 1
-        if j == i - 1:  # no digits before this hyphen
-            continue
-        try:
-            no = int(raw[j + 1:i])
-        except ValueError:
-            continue
-        if no < 1:
-            continue
-        out.append((no, raw[i + 1:]))
-        if len(out) >= 8:
-            break
-    return out
-
-
-def _pick_ctx_cand(cands, line, before):
-    """Choose the split consistent with the neighbor line: before context
-    takes the largest candidate below the match, after context the smallest
-    above the last hit. Falls back to the first (rightmost) candidate."""
-    best = None
-    for c in cands:
-        if (before and c[0] < line) or (not before and c[0] > line):
-            if best is None:
-                best = c
-            elif (before and c[0] > best[0]) or (not before and c[0] < best[0]):
-                best = c
-    return best if best is not None else cands[0]
-
-
-def _collect_hits_ctx(out, engine, limit, offset):
-    """Parse rg -C output: "--" separates disjoint groups; match rows are
-    "path:line:content", context rows "path-line-content". Only match rows
-    count toward total_hits. Context rows render into a gutter string on the
-    hit: "N-line" before the match, "N+line" after."""
-    hits = []
-    total = 0
-    before = []        # context rows awaiting their match (after a "--")
-    after_open = False # context rows attach to the last hit as after-lines
-    for raw in out.splitlines():
-        if not raw:
-            continue
-        if raw == "--":
-            before = []
-            after_open = False
-            continue
-        m = _HIT_LINE_RX.match(raw)
-        if m is None:
-            cands = _ctx_candidates(raw)
-            if not cands:
-                continue
-            if after_open and hits:
-                # after-line: smallest line number still above the last hit
-                no, line = _pick_ctx_cand(cands, hits[-1]["line"], False)
-                hits[-1]["_ctx"].append(f"{no}+{_clamp_line(line)}")
-            else:
-                before.append(cands)
-            continue
-        total += 1
-        if total <= offset or len(hits) >= limit:
-            before = []
-            after_open = False
-            continue
-        h = {"path": m.group(1), "line": int(m.group(2)),
-             "content": _clamp_line(m.group(3)), "_ctx": []}
-        if before:
-            # before-lines sit directly above this match: take the largest
-            # candidate line number still below it
-            rows = []
-            for cands in before:
-                no, line = _pick_ctx_cand(cands, h["line"], True)
-                rows.append(f"{no}-{_clamp_line(line)}")
-            h["_ctx"] = rows
-            before = []
-        hits.append(h)
-        after_open = True
-    for h in hits:
-        ctx = h.pop("_ctx")
-        if ctx:
-            h["context"] = "\n".join(ctx)
-    return _j({"success": True, "engine": engine, "hits": hits,
-               "total_hits": total, "shown": len(hits),
-               "truncated": total > offset + len(hits)})
+def _glob_ok(pat):
+    """fnmatch never errors, but Go's filepath.Match does (ErrBadPattern on
+    an unterminated '[' class) — pre-validate so both impls reject the same
+    patterns. Also guard against a pathological translate() regex."""
+    import fnmatch
+    i, n = 0, len(pat)
+    while i < n:
+        c = pat[i]
+        i += 1
+        if c == "[":
+            if i < n and pat[i] in "!^":
+                i += 1
+            if i < n and pat[i] == "]":
+                i += 1
+            while i < n and pat[i] != "]":
+                i += 1
+            if i >= n:
+                return False  # unterminated character class
+            i += 1
+    try:
+        re.compile(fnmatch.translate(pat))
+    except re.error:
+        return False
+    return True
 
 
 def _ctx_row(no, line, sep):
@@ -503,6 +548,8 @@ def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset,
     except re.error as e:
         return _err(f"invalid regex: {e}")
     root = _resolve(path)
+    if file_glob and not _glob_ok(file_glob):
+        return _err(f"invalid pattern: {file_glob}")
     hits = []
     total = 0
     timed_out = False
@@ -535,7 +582,7 @@ def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset,
                 text = raw.decode("utf-8-sig")
             except UnicodeDecodeError:
                 continue
-            lines = text.splitlines()
+            lines = _split_lines(text)
             for i, line in enumerate(lines):
                 if not rx.search(line):
                     continue
@@ -558,13 +605,16 @@ def _search_walk(pattern, path, file_glob, case_sensitive, limit, offset,
             break
     return _j({"success": True, "engine": "walk", "hits": hits,
                "total_hits": total, "shown": len(hits),
-               "truncated": timed_out or total > offset + len(hits)})
+               "truncated": timed_out or total > offset + len(hits),
+               "capped": False})
 
 
 def fast_search(pattern, path, file_glob=None, case_sensitive=True,
                 limit=100, offset=0, context=0):
     if not isinstance(pattern, str) or not pattern:
         return _err("pattern must be a non-empty string (ripgrep regex syntax)")
+    if not isinstance(path, str) or not path:
+        return _err("path must be a non-empty string")
     limit = max(1, min(int(limit), 2000))
     offset = max(0, int(offset))
     context = _clamp_ctx(context)
@@ -637,9 +687,11 @@ def _tree_skip(name):
 def fast_tree(path, max_depth=3, max_entries=500, pattern=None):
     """Budgeted directory listing. Deterministic dirs-first, alphabetical
     order; depth (1-10) and entry (1-5000) budgets; optional basename
-    pattern filter (fnmatch — a filtered-out dir is still descended into).
-    Shared skip list: .git, node_modules, __pycache__, .venv, target,
-    dist, build, *_cache. No .gitignore parsing."""
+    pattern filter (fnmatch — a filtered-out dir is still descended into;
+    invalid patterns error). Shared skip list: .git, node_modules,
+    __pycache__, .venv, target, dist, build, *_cache. Symlinks are reported
+    via lstat (is_symlink, never descended into, dangling included). No
+    .gitignore parsing."""
     if not USE_FASTLANE:
         return _err("TOOLRUSH_FASTLANE=0 — lane disabled; use the harness's "
                     "native listing")
@@ -648,46 +700,55 @@ def fast_tree(path, max_depth=3, max_entries=500, pattern=None):
         max_entries = int(max_entries)
     except (TypeError, ValueError):
         return _err("max_depth and max_entries must be integers")
+    if not isinstance(path, str) or not path:
+        return _err("path must be a non-empty string")
     root = _resolve(path)
     if not root.is_dir():
         return _err(f"Directory not found: {path}")
     max_depth = max(1, min(max_depth, 10))
     max_entries = max(1, min(max_entries, 5000))
+    if pattern is not None:
+        if not isinstance(pattern, str):
+            return _err("pattern must be a string")
+        if not _glob_ok(pattern):
+            return _err(f"invalid pattern: {pattern}")
     _STATS["fast_tree"] += 1
     import fnmatch
     entries = []
-    truncated = False
+    omitted = False  # an entry was left out because of max_entries
     for dirpath, dirnames, filenames in os.walk(root):
-        if truncated:
+        if omitted:
             break
         rel = os.path.relpath(dirpath, root)
         # children of the root are depth 1
         depth = 1 if rel == os.curdir else rel.count(os.sep) + 2
-        # prune: skip-listed dirs never appear nor get descended into
+        # prune: skip-listed dirs never appear nor get descended into.
+        # os.walk(followlinks=False) already refuses to descend into
+        # symlinked dirs; lstat below reports them as is_symlink/is_dir:false.
         dirnames[:] = sorted(d for d in dirnames if not _tree_skip(d))
-        rows = [(name, True) for name in dirnames]
-        rows += [(name, False) for name in sorted(filenames)
-                 if not _tree_skip(name)]
-        for name, is_dir in rows:
-            if truncated:
-                break
-            if pattern and not fnmatch.fnmatch(name, pattern):
-                continue
+        rows = list(dirnames) + sorted(f for f in filenames
+                                       if not _tree_skip(f))
+        for name in rows:
             fp = os.path.join(dirpath, name)
             try:
-                st = os.stat(fp)
+                st = os.lstat(fp)
             except OSError:
                 continue
-            entries.append({"path": fp, "is_dir": is_dir,
-                            "size": st.st_size, "mtime": int(st.st_mtime)})
+            if pattern and not fnmatch.fnmatch(name, pattern):
+                continue
             if len(entries) >= max_entries:
-                truncated = True
+                omitted = True  # more matching entries exist beyond the cap
+                break
+            is_link = stat.S_ISLNK(st.st_mode)
+            entries.append({"path": fp,
+                            "is_dir": stat.S_ISDIR(st.st_mode) and not is_link,
+                            "is_symlink": is_link,
+                            "size": st.st_size, "mtime": int(st.st_mtime)})
         # stop descending past the depth budget only AFTER this directory's
         # entries were listed (its child dirs are depth+1, still in budget)
         if depth >= max_depth:
             dirnames[:] = []
-        if truncated:
-            break
+    truncated = omitted  # exact fit at max_entries is NOT truncated
     d = {"success": True, "entries": entries, "total": len(entries),
          "truncated": truncated}
     if truncated:
@@ -762,31 +823,61 @@ class WarmShell:
                 self._spawn(cwd)
                 _STATS["shell_respawns"] += 1
             proc, q = self._proc, self._q
-            # Drain strays (output of earlier backgrounded jobs)
+            # Drain strays (output of earlier backgrounded jobs). A death
+            # sentinel (None) here means the shell died between the liveness
+            # check and the write: respawn BEFORE submitting the frame —
+            # reporting it as died-mid-command would be a lie.
             while True:
                 try:
-                    q.get_nowait()
+                    stray = q.get_nowait()
                 except queue.Empty:
+                    break
+                if stray is None:
+                    _STATS["shell_respawns"] += 1
+                    self._spawn(cwd)
+                    proc, q = self._proc, self._q
                     break
             if cwd and os.path.abspath(cwd) != self._cwd:
                 command = f"cd {_shq(cwd)} && {{ {command}\n}}"
             mid = uuid.uuid4().hex[:12]
             begin, endm = f"TRB{mid}", f"TRE{mid}:"
-            # Markers lead with \n so output without a trailing newline can
-            # never glue the marker onto the last output line. The END marker
-            # carries rc AND $PWD — real cwd is read back from the shell, so
-            # `cd` inside a user command can never desync the tracker.
-            frame = (f"printf '%s\\n' '{begin}'; {{ {command}\n}}; _rc=$?; "
+            # Both markers lead with \n so output without a trailing newline
+            # can never glue a marker onto the last output line, and any
+            # stray unterminated background output dies on its own line; the
+            # reader discards EMPTY lines until the begin marker. The END
+            # marker carries rc AND $PWD — real cwd is read back from the
+            # shell, so `cd` inside a user command can never desync the
+            # tracker.
+            frame = (f"printf '\\n%s\\n' '{begin}'; {{ {command}\n}}; _rc=$?; "
                      f"printf '\\n%s:%d:%s\\n' '{endm[:-1]}' $_rc \"$PWD\"\n")
-            try:
-                proc.stdin.write(frame.encode())
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+            payload = frame.encode()
+            deadline = time.monotonic() + timeout
+            # Write wedge guard: a SIGSTOPped shell + a >64KB frame would
+            # block write+flush past the deadline. Run the write in a
+            # short-lived thread and join(remaining); on timeout kill the
+            # tree (the leaked writer unblocks via EPIPE once it dies).
+            written = threading.Event()
+
+            def _writer():
+                try:
+                    proc.stdin.write(payload)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass  # shell died under us; the reader reports the death
+                finally:
+                    written.set()
+
+            threading.Thread(target=_writer, daemon=True).start()
+            if not written.wait(max(0.0, deadline - time.monotonic())):
+                self._kill_tree()
+                return (f"\n[timed out after {timeout}s — command tree "
+                        f"killed, shell will respawn]", 124, False)
+            if not self._alive():  # write raced a shell death
                 self._proc = None
                 return "", -1, False
             out, nbytes, rc = [], 0, -1
             truncated = False
-            deadline = time.monotonic() + timeout
+            begun = False
             while True:
                 remain = deadline - time.monotonic()
                 if remain <= 0:
@@ -804,8 +895,13 @@ class WarmShell:
                 if line is None:  # shell died mid-command; do NOT retry
                     self._proc = None
                     return "".join(out), -1, truncated
-                if line == begin:
-                    continue
+                if not begun:
+                    if line == "":
+                        continue  # begin marker's leading \n / blank strays
+                    if line == begin:
+                        begun = True
+                        continue
+                    # else: a racing non-empty stray before begin — keep it
                 if line.startswith(endm):
                     parts = line.split(":", 2)
                     if len(parts) == 3:
@@ -853,6 +949,8 @@ def warm_exec(command, cwd=None, timeout=EXEC_DEFAULT_TIMEOUT, reset=False):
     global _SHELL
     if not isinstance(command, str) or not command.strip():
         return _err("command must be a non-empty string")
+    if isinstance(cwd, str) and ("\n" in cwd or "\r" in cwd):
+        return _err("cwd must not contain newline characters")
     timeout = max(1, min(int(timeout), 3600))
     _STATS["warm_exec"] += 1
     if not USE_PERSIST:
@@ -926,14 +1024,19 @@ def batch_exec(commands, cwd=None, timeout=EXEC_DEFAULT_TIMEOUT):
         return _err("commands must be a non-empty list of strings")
     if len(commands) > BATCH_MAX:
         return _err(f"batch too large: {len(commands)} > {BATCH_MAX} — split it")
+    if isinstance(cwd, str) and ("\n" in cwd or "\r" in cwd):
+        return _err("cwd must not contain newline characters")
     for i, cmd in enumerate(commands):
         if not isinstance(cmd, str) or not cmd.strip():
             return _err(f"command {i} invalid: must be a non-empty string")
     _STATS["batch_exec"] += 1
     results = []
     fresh = False
-    for cmd in commands:
-        r = json.loads(warm_exec(cmd, cwd=cwd, timeout=timeout))
+    for i, cmd in enumerate(commands):
+        # cwd applies to the FIRST command only; later commands inherit
+        # whatever state (including cd) the first one left behind.
+        r = json.loads(warm_exec(cmd, cwd=cwd if i == 0 else None,
+                                 timeout=timeout))
         if fresh:
             r["note"] = "ran on a fresh shell — prior command killed the warm one"
         results.append(_j(r))
@@ -983,9 +1086,10 @@ TOOLS = [
                          "limit": {"type": "integer", "default": 1000}},
                      "required": ["path"]}},
     {"name": "batch_read",
-     "description": "Read 1-16 files in ONE call on a 4-worker pool. Input "
-                    "order preserved; the whole batch is validated before "
-                    "anything runs. Each op: {path, offset?, limit?}.",
+     "description": "Read 1-16 files in ONE serial call (one MCP round trip, "
+                    "not in-process parallelism). Input order preserved; the "
+                    "whole batch is validated before anything runs. Each op: "
+                    "{path, offset?, limit?}. Read-only.",
      "inputSchema": {"type": "object",
                      "properties": {
                          "ops": {"type": "array",
@@ -997,11 +1101,12 @@ TOOLS = [
                                            "required": ["path"]}}},
                      "required": ["ops"]}},
     {"name": "fast_search",
-     "description": "Content search via direct ripgrep transport (respects "
-                    ".gitignore, real regex grammar). Falls back to a "
-                    "pure-Python walk when rg is unavailable. context=N "
-                    "(0-5) adds N lines of gutter around each hit: "
-                    "\"L-line\" before, \"L+line\" after.",
+     "description": "Content search via direct ripgrep transport (--json "
+                    "stream; respects .gitignore, real regex grammar). Falls "
+                    "back to a pure-Python walk when rg is unavailable or "
+                    "disabled. context=N (0-5) adds N lines of gutter per "
+                    "hit: \"L-line\" before, \"L+line\" after. Envelope "
+                    "carries total_hits, shown, truncated, capped. Read-only.",
      "inputSchema": {"type": "object",
                      "properties": {
                          "pattern": {"type": "string"},
@@ -1013,13 +1118,12 @@ TOOLS = [
                          "offset": {"type": "integer", "default": 0}},
                      "required": ["pattern", "path"]}},
     {"name": "batch_search",
-     "description": "Run 1-16 content searches in ONE call, order-preserving; "
-                    "the whole batch is validated before anything runs and "
-                    "per-op failures are isolated. The Go server fans the "
-                    "ops out in parallel (each spawns its own rg); this "
-                    "reference runs them sequentially. Each op: {pattern, "
-                    "path, file_glob?, case_sensitive?, context?, limit?, "
-                    "offset?}.",
+     "description": "Run 1-16 content searches in ONE call, sequentially "
+                    "(one MCP round trip, not in-process parallelism). Order "
+                    "preserved; the whole batch is validated before anything "
+                    "runs; per-op failures stay isolated. Each op: "
+                    "{pattern, path, file_glob?, case_sensitive?, context?, "
+                    "limit?, offset?}.",
      "inputSchema": {"type": "object",
                      "properties": {
                          "ops": {"type": "array",
@@ -1156,6 +1260,10 @@ def serve():
                     text = fn(args)
                     _reply(mid, {"content": [{"type": "text", "text": text}],
                                  "isError": _env_is_error(text)})
+                except TypeError as e:  # JSON type / wrong-shape arguments
+                    _reply(mid, {"content": [{"type": "text",
+                                              "text": _err(f"invalid arguments: {e}")}],
+                                 "isError": True})
                 except Exception as e:
                     _reply(mid, {"content": [{"type": "text",
                                               "text": _err(f"{type(e).__name__}: {e}")}],
